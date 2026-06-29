@@ -1,7 +1,8 @@
 # ADR-0001: Update-existing-only scope (no install-from-scratch)
 
 ## Status
-Accepted
+Superseded by ADR-0006 (install-when-missing). The v1 update-existing-only scope
+below was the original decision; install-from-scratch is now in scope.
 
 ## Date
 2026-06-29

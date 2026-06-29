@@ -11,8 +11,80 @@
 //! not here — core only fixes the program/args shape.
 
 use crate::core::error::PlanError;
-use crate::core::{InstallMethod, Os, UpdatePlan};
+use crate::core::{InstallMethod, InstallPlan, Os, UpdatePlan};
 use semver::Version;
+
+/// Resolve the NATIVE from-scratch install command for `os`, given which manager
+/// executables are available on PATH (ADR-0006). Precedence per OS mirrors the
+/// update detection order. Returns `None` when no native channel is available —
+/// the host then falls back to the portable installer (delivered separately).
+///
+/// `apt`/`dnf` are intentionally excluded as auto-install channels: a from-zero
+/// install through them requires configuring Microsoft's package repository
+/// first (multi-step, root) — those hosts get the portable install instead.
+pub fn resolve_install(os: Os, available: &[InstallMethod]) -> Option<InstallPlan> {
+    let has = |m: InstallMethod| available.contains(&m);
+    let plan = |method, program: &str, args: &[&str], requires_elevation| InstallPlan {
+        method,
+        program: program.to_string(),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        requires_elevation,
+    };
+    match os {
+        Os::Windows => {
+            if has(InstallMethod::Winget) {
+                Some(plan(
+                    InstallMethod::Winget,
+                    "winget",
+                    &[
+                        "install",
+                        "--id",
+                        "Microsoft.PowerShell",
+                        "--source",
+                        "winget",
+                        "--silent",
+                        "--accept-source-agreements",
+                        "--accept-package-agreements",
+                    ],
+                    false, // per-user winget scope
+                ))
+            } else if has(InstallMethod::Chocolatey) {
+                Some(plan(
+                    InstallMethod::Chocolatey,
+                    "choco",
+                    &["install", "powershell-core", "-y"],
+                    true,
+                ))
+            } else {
+                None
+            }
+        }
+        Os::Macos => {
+            if has(InstallMethod::Homebrew) {
+                Some(plan(
+                    InstallMethod::Homebrew,
+                    "brew",
+                    &["install", "--cask", "powershell"],
+                    false,
+                ))
+            } else {
+                None
+            }
+        }
+        Os::Linux => {
+            if has(InstallMethod::Snap) {
+                Some(plan(
+                    InstallMethod::Snap,
+                    "snap",
+                    &["install", "powershell", "--classic"],
+                    true,
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
 
 /// Build the update plan for the selected method on the given OS.
 ///
@@ -126,6 +198,55 @@ mod tests {
 
     fn plan(method: InstallMethod, os: Os) -> UpdatePlan {
         build_plan(method, v("7.4.0"), v("7.5.0"), os).unwrap()
+    }
+
+    #[test]
+    fn resolve_install_windows_prefers_winget_over_choco() {
+        let p = resolve_install(
+            Os::Windows,
+            &[InstallMethod::Chocolatey, InstallMethod::Winget],
+        )
+        .unwrap();
+        assert_eq!(p.method, InstallMethod::Winget);
+        assert_eq!(p.program, "winget");
+        assert_eq!(p.args.first().map(String::as_str), Some("install"));
+        assert!(p.args.iter().any(|a| a == "Microsoft.PowerShell"));
+        assert!(!p.requires_elevation);
+    }
+
+    #[test]
+    fn resolve_install_windows_falls_back_to_choco() {
+        let p = resolve_install(Os::Windows, &[InstallMethod::Chocolatey]).unwrap();
+        assert_eq!(p.method, InstallMethod::Chocolatey);
+        assert_eq!(p.program, "choco");
+        assert!(p.args.iter().any(|a| a == "install"));
+        assert!(p.requires_elevation);
+    }
+
+    #[test]
+    fn resolve_install_macos_uses_homebrew_cask() {
+        let p = resolve_install(Os::Macos, &[InstallMethod::Homebrew]).unwrap();
+        assert_eq!(p.program, "brew");
+        assert_eq!(p.args, vec!["install", "--cask", "powershell"]);
+        assert!(!p.requires_elevation);
+    }
+
+    #[test]
+    fn resolve_install_linux_uses_snap_classic_with_elevation() {
+        let p = resolve_install(Os::Linux, &[InstallMethod::Snap]).unwrap();
+        assert_eq!(p.program, "snap");
+        assert_eq!(p.args, vec!["install", "powershell", "--classic"]);
+        assert!(p.requires_elevation);
+    }
+
+    #[test]
+    fn resolve_install_none_when_no_native_channel() {
+        // apt/dpkg present but not a supported auto-install channel -> None
+        // (host falls back to the portable installer).
+        assert!(resolve_install(Os::Linux, &[InstallMethod::AptDpkg]).is_none());
+        assert!(resolve_install(Os::Linux, &[]).is_none());
+        assert!(resolve_install(Os::Macos, &[]).is_none());
+        assert!(resolve_install(Os::Windows, &[]).is_none());
     }
 
     #[test]

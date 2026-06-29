@@ -24,6 +24,15 @@ upgrades through the owning channel.
 5. Either reports what it would do (`--check`) or performs the upgrade through
    the detected channel (default).
 
+If PowerShell is **not installed**, the tool installs it from scratch via the
+OS's native package manager — winget (then Chocolatey) on Windows, Homebrew on
+macOS, snap on Linux — and `--check` reports the install command it would run.
+It installs only when none is present, so it never creates a second, conflicting
+install. On a host with no supported native manager it currently reports that it
+cannot install (install PowerShell manually); a portable `~/.local` install for
+that case is planned (ADR-0006). As with updates, it never self-elevates —
+it surfaces an elevation requirement and stops.
+
 It never fabricates a version: if a source cannot be fetched or parsed, it
 surfaces the error and exits non-zero without printing any "latest version".
 
@@ -115,9 +124,6 @@ fi
 
 ## Non-goals
 
-- Does **not** install PowerShell from scratch. v1 only updates an existing
-  `pwsh`; a machine with no PowerShell installed is reported as such, not
-  installed.
 - Does **not** manage Windows PowerShell 5.1 (the in-box `powershell.exe`,
   Desktop edition). Only the cross-platform `pwsh` (PowerShell 6+/Core) is in
   scope.

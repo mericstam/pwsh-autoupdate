@@ -43,7 +43,9 @@ pub enum DetectError {
     #[error("could not parse installed version {raw:?}: {reason}")]
     UnparseableVersion { raw: String, reason: String },
 
-    /// PowerShell is not installed (ADR-0001: report and exit, do not install).
+    /// PowerShell is not installed. Since ADR-0006 the host installs from
+    /// scratch rather than treating this as terminal; this variant remains the
+    /// typed representation of the absent state.
     #[error("PowerShell is not installed")]
     NotInstalled,
 }

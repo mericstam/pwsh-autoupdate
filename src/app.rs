@@ -15,7 +15,9 @@ use crate::adapters::http::HttpClient;
 use crate::adapters::runner::CommandRunner;
 use crate::adapters::{probe, resolve_latest_stable};
 use crate::core::error::CoreError;
-use crate::core::{detect, plan, report::CheckReport, version, Detection, Os, VersionState};
+use crate::core::{
+    detect, plan, report::CheckReport, version, Detection, InstallMethod, Os, VersionState,
+};
 use std::io::Write;
 
 /// `User-Agent` sent on every upstream request (GitHub rejects requests with
@@ -62,13 +64,34 @@ pub fn run_check(
 ) -> i32 {
     let signals = probe::probe(runner, os);
 
-    // pwsh absent: report not-installed and exit error — never install (ADR-0001).
+    // pwsh absent: dry-run report of the from-scratch install (ADR-0006). No
+    // side effect — `--check` only reports what `would` install.
     if !signals.pwsh_present {
-        let _ = writeln!(
-            err,
-            "error: PowerShell (pwsh) is not installed; nothing to update (this tool only updates an existing install)"
-        );
-        return EXIT_CHECK_ERROR;
+        match plan::resolve_install(os, &signals.available_managers) {
+            Some(ip) => {
+                let _ = writeln!(out, "PowerShell is not installed.");
+                // The latest version is informational; the native installer
+                // always fetches the current release itself. A source failure
+                // must not block the install report (and never fabricates).
+                if let Ok(latest) = resolve_latest_stable(http) {
+                    let _ = writeln!(out, "Latest version:  {}", latest.version);
+                }
+                let _ = writeln!(
+                    out,
+                    "Would install:   {} (via {})",
+                    render_command(&ip.program, &ip.args),
+                    ip.method.label()
+                );
+                return EXIT_UPDATE_AVAILABLE;
+            }
+            None => {
+                let _ = writeln!(
+                    err,
+                    "error: PowerShell is not installed and no supported package manager (winget/Chocolatey, Homebrew, snap) was found to install it; install PowerShell manually."
+                );
+                return EXIT_CHECK_ERROR;
+            }
+        }
     }
 
     // Parse the installed version. A missing/unparseable version is an honest
@@ -170,7 +193,7 @@ extern "C" {
     fn libc_geteuid() -> u32;
 }
 
-/// The default update path (FR-1/6/11/12; ADR-0001/0002).
+/// The default update path (FR-1/6/11/12; ADR-0002/0006).
 ///
 /// Builds the real privilege check and delegates to [`run_update_with`]. This is
 /// the function `main.rs` calls; tests drive [`run_update_with`] with an injected
@@ -188,8 +211,8 @@ pub fn run_update(
 /// The update flow with the privilege state injected (testable).
 ///
 /// Flow (design Section 7):
-/// 1. probe; pwsh absent → report not-installed, exit non-zero, no install
-///    (ADR-0001).
+/// 1. probe; pwsh absent → auto-install from scratch via the native channel
+///    (ADR-0006); no native channel → honest "cannot install" error.
 /// 2. parse current version (honest error on failure).
 /// 3. resolve latest stable over HTTP; failure → exit non-zero, no fabricated
 ///    version (FR-11).
@@ -212,12 +235,11 @@ pub fn run_update_with(
 ) -> i32 {
     let signals = probe::probe(runner, os);
 
+    // pwsh absent: auto-install from scratch (ADR-0006) instead of erroring. We
+    // only install when NONE is present, so this never creates a second,
+    // conflicting install.
     if !signals.pwsh_present {
-        let _ = writeln!(
-            err,
-            "error: PowerShell (pwsh) is not installed; nothing to update (this tool only updates an existing install)"
-        );
-        return EXIT_FAILURE;
+        return install_missing(runner, os, &signals.available_managers, elevated, out, err);
     }
 
     let current = match signals.current_version.as_deref() {
@@ -298,11 +320,7 @@ pub fn run_update_with(
         return EXIT_FAILURE;
     }
 
-    let cmd_display = if plan.args.is_empty() {
-        plan.program.clone()
-    } else {
-        format!("{} {}", plan.program, plan.args.join(" "))
-    };
+    let cmd_display = render_command(&plan.program, &plan.args);
     let _ = writeln!(
         out,
         "Updating PowerShell {} -> {} via {} ...",
@@ -371,12 +389,108 @@ pub fn run_update_with(
     }
 }
 
+/// Render a `program args...` command line for display in reports and logs.
+fn render_command(program: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    }
+}
+
+/// Install PowerShell from scratch when none is present (ADR-0006): resolve the
+/// native channel and run it. Honors FR-12 (never self-elevate) and FR-6 (the
+/// owning manager must be on PATH; never fall back to another channel). When no
+/// native channel is available the host falls back to the portable installer
+/// (delivered separately) — until then this is an honest "cannot install"
+/// error, never a stub. We are called only when pwsh is absent, so installing
+/// can never create a second, conflicting install.
+fn install_missing(
+    runner: &dyn CommandRunner,
+    os: Os,
+    available: &[InstallMethod],
+    elevated: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let ip = match plan::resolve_install(os, available) {
+        Some(ip) => ip,
+        None => {
+            let _ = writeln!(
+                err,
+                "error: PowerShell is not installed and no supported package manager (winget/Chocolatey, Homebrew, snap) was found to install it; install PowerShell manually."
+            );
+            return EXIT_FAILURE;
+        }
+    };
+
+    // FR-12: surface a privilege requirement; never self-elevate.
+    if ip.requires_elevation && !elevated {
+        let _ = writeln!(
+            err,
+            "error: installing PowerShell via {} requires elevated privileges. Re-run with elevation (e.g. sudo / an elevated shell); this tool will not self-elevate.",
+            ip.method.label()
+        );
+        return EXIT_FAILURE;
+    }
+
+    // FR-6: the install manager must be on PATH (it came from the available set,
+    // but assert before the mutating call rather than assume).
+    if !runner.exists(&ip.program) {
+        let _ = writeln!(
+            err,
+            "error: the required package manager '{}' was not found on PATH; not attempting any other channel.",
+            ip.program
+        );
+        return EXIT_FAILURE;
+    }
+
+    let _ = writeln!(
+        out,
+        "PowerShell is not installed. Installing via {} ...",
+        ip.method.label()
+    );
+    let _ = writeln!(out, "Running: {}", render_command(&ip.program, &ip.args));
+
+    // The ONLY mutating call.
+    let arg_refs: Vec<&str> = ip.args.iter().map(String::as_str).collect();
+    match runner.run(&ip.program, &arg_refs) {
+        Ok(output) if output.status == 0 => {
+            let _ = writeln!(
+                out,
+                "PowerShell installed successfully via {}.",
+                ip.method.label()
+            );
+            EXIT_SUCCESS
+        }
+        Ok(output) => {
+            let _ = writeln!(
+                err,
+                "error: install via {} failed (exit {}). PowerShell was not installed.",
+                ip.method.label(),
+                output.status
+            );
+            if !output.stderr.trim().is_empty() {
+                let _ = writeln!(err, "{}", output.stderr.trim_end());
+            }
+            EXIT_FAILURE
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "error: failed to run installer '{}': {e}. PowerShell was not installed.",
+                ip.program
+            );
+            EXIT_FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::adapters::http::{BUILD_INFO_STABLE_URL, GITHUB_RELEASES_LATEST_URL};
     use crate::core::error::SourceError;
-    use crate::core::InstallMethod;
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
 
@@ -608,15 +722,35 @@ mod tests {
     }
 
     #[test]
-    fn check_pwsh_absent_exits_2_without_installing() {
+    fn check_pwsh_absent_no_native_manager_exits_2() {
+        // Absent + no supported installer -> honest error, exit 2, no mutation.
+        // (Portable install is delivered separately, ADR-0006 step 2.)
         let http = FakeHttp::ok("7.5.0");
-        let runner = FakeRunner::default(); // pwsh not present
+        let runner = FakeRunner::default(); // pwsh not present, no managers
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_check(&http, &runner, Os::Linux, &mut out, &mut err);
         assert_eq!(code, EXIT_CHECK_ERROR);
         assert!(String::from_utf8(err).unwrap().contains("not installed"));
-        assert!(runner.runs.borrow().is_empty());
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn check_pwsh_absent_with_manager_reports_would_install_no_side_effect() {
+        // Absent + snap available -> dry-run reports the install command, exit 1,
+        // and performs NO mutation (--check is side-effect free, ADR-0006).
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::default().with_manager("snap", "");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_check(&http, &runner, Os::Linux, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(code, EXIT_UPDATE_AVAILABLE);
+        assert!(stdout.contains("not installed"));
+        assert!(stdout.contains("Would install:"));
+        assert!(stdout.contains("snap install powershell --classic"));
+        assert!(stdout.contains("Latest version:  7.5.0"));
+        assert!(mutating_runs(&runner).is_empty());
     }
 
     #[test]
@@ -810,15 +944,72 @@ mod tests {
     }
 
     #[test]
-    fn update_pwsh_absent_exits_nonzero_without_installing() {
+    fn update_pwsh_absent_no_native_manager_errors_without_installing() {
+        // Absent + no supported installer -> honest error, no mutation. (Portable
+        // install is delivered separately, ADR-0006 step 2.)
         let http = FakeHttp::ok("7.5.0");
         let runner = FakeRunner::default();
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_update_with(&http, &runner, Os::Linux, false, &mut out, &mut err);
         assert_ne!(code, EXIT_SUCCESS);
-        assert!(String::from_utf8(err).unwrap().contains("not installed"));
-        assert!(runner.runs.borrow().is_empty());
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(stderr.contains("not installed"));
+        assert!(stderr.contains("no supported package manager"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn update_pwsh_absent_auto_installs_via_native_manager() {
+        // Absent + snap available + elevated -> runs the install command (ADR-0006).
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::default().with_manager("snap", "");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Linux, true, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(stdout.contains("Installing via snap"));
+        assert!(stdout.contains("installed successfully"));
+        let muts = mutating_runs(&runner);
+        assert_eq!(muts.len(), 1, "exactly one mutating (install) call");
+        assert_eq!(muts[0].0, "snap");
+        assert_eq!(muts[0].1, vec!["install", "powershell", "--classic"]);
+    }
+
+    #[test]
+    fn update_pwsh_absent_install_needs_elevation_does_not_self_elevate() {
+        // Absent + snap available but not elevated -> surface requirement, no
+        // mutation, never self-elevate (FR-12).
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::default().with_manager("snap", "");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Linux, false, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(stderr.contains("elevated privileges"));
+        assert!(stderr.contains("will not self-elevate"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn update_pwsh_absent_install_failure_surfaces_and_exits_nonzero() {
+        // Absent + manager present but the install command fails -> surface
+        // stderr, never report success.
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::default()
+            .with_manager("snap", "")
+            .fail_upgrade(1, "snap: install failed");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Linux, true, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(!stdout.contains("installed successfully"));
+        assert!(stderr.contains("install via snap failed"));
+        assert!(stderr.contains("snap: install failed"));
     }
 
     #[test]

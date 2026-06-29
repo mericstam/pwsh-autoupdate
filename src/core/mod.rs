@@ -106,6 +106,21 @@ pub enum VersionState {
     UpdateAvailable,
 }
 
+/// A from-scratch install plan (ADR-0006): the native package-manager command
+/// that installs PowerShell when none is present. Mirrors [`UpdatePlan`]'s
+/// command shape so the host runs and reports it the same way. Resolved only
+/// from the set of available managers — when none is available the host falls
+/// back to the portable installer (delivered separately).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallPlan {
+    pub method: InstallMethod,
+    pub program: String,
+    pub args: Vec<String>,
+    /// FR-12: the host surfaces this before execution; the tool never
+    /// self-elevates.
+    pub requires_elevation: bool,
+}
+
 /// The plan — built once, drives BOTH the `--check` report and the real update
 /// (FR-9 agreement: reported command equals executed command).
 #[derive(Debug, Clone, PartialEq, Eq)]
