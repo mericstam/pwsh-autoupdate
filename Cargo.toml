@@ -1,6 +1,6 @@
 [package]
 name = "pwsh-autoupdate"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Detects how PowerShell was installed and updates it via the owning package manager."
 license = "MIT OR Apache-2.0"
