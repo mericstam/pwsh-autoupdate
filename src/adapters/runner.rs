@@ -162,48 +162,15 @@ mod tests {
         assert!(!runner.exists("brew"));
     }
 
+    // A single test owns the global-PATH critical section. `exists()` reads the
+    // process-wide PATH env var, so two tests mutating it run as a data race
+    // under cargo's multi-threaded runner (flaky, worst on Windows). Keeping
+    // exactly one PATH-mutating test makes the suite deterministic.
     #[test]
-    fn real_runner_exists_finds_executable_on_path() {
-        // Drive the real PATH-lookup logic with a temp dir on PATH holding a
-        // file named like the program (+ platform EXE suffix). No subprocess.
+    fn real_runner_exists_path_resolution() {
+        // One temp dir on PATH holds a file named "<name><suffix>". No subprocess.
         let dir = tempfile::tempdir().unwrap();
         let name = "psautoupdater-fake-mgr";
-        let file = dir
-            .path()
-            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
-
-        let prev = std::env::var_os("PATH");
-        let mut paths: Vec<std::path::PathBuf> = prev
-            .as_ref()
-            .map(|p| std::env::split_paths(p).collect())
-            .unwrap_or_default();
-        paths.insert(0, dir.path().to_path_buf());
-        let joined = std::env::join_paths(&paths).unwrap();
-        // SAFETY: single-threaded test; PATH is restored before returning.
-        std::env::set_var("PATH", &joined);
-
-        let runner = RealRunner;
-        let found = runner.exists(name);
-        let missing = runner.exists("psautoupdater-definitely-absent-xyz");
-
-        match prev {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
-
-        assert!(found, "real exists() should locate a file on PATH");
-        assert!(!missing, "real exists() should not find an absent program");
-    }
-
-    #[test]
-    fn real_runner_exists_accepts_already_suffixed_name() {
-        // On Windows the probe asks for the resolved exe ("pwsh.exe"); exists()
-        // must not append a second ".exe". The on-disk file is "<name><suffix>",
-        // and BOTH the bare and the already-suffixed lookups must find it. On
-        // Unix EXE_SUFFIX is empty, so the two forms coincide and still pass.
-        let dir = tempfile::tempdir().unwrap();
-        let name = "psautoupdater-fake-pwsh";
         let suffix = std::env::consts::EXE_SUFFIX;
         let on_disk = format!("{name}{suffix}");
         std::fs::write(dir.path().join(&on_disk), b"#!/bin/sh\n").unwrap();
@@ -215,11 +182,16 @@ mod tests {
             .unwrap_or_default();
         paths.insert(0, dir.path().to_path_buf());
         let joined = std::env::join_paths(&paths).unwrap();
-        // SAFETY: single-threaded test; PATH is restored before returning.
+        // SAFETY: single-threaded critical section; PATH is restored before returning.
         std::env::set_var("PATH", &joined);
 
         let runner = RealRunner;
-        let bare = runner.exists(name);
+        // Bare name resolves via the platform suffix.
+        let found = runner.exists(name);
+        let missing = runner.exists("psautoupdater-definitely-absent-xyz");
+        // Already-suffixed name (as the probe passes "pwsh.exe" on Windows) must
+        // NOT be double-suffixed into "pwsh.exe.exe". On Unix EXE_SUFFIX is empty
+        // so this coincides with the bare lookup.
         let suffixed = runner.exists(&on_disk);
 
         match prev {
@@ -227,7 +199,8 @@ mod tests {
             None => std::env::remove_var("PATH"),
         }
 
-        assert!(bare, "bare name should resolve with the platform suffix");
+        assert!(found, "real exists() should locate a file on PATH");
+        assert!(!missing, "real exists() should not find an absent program");
         assert!(
             suffixed,
             "already-suffixed name must not be double-suffixed (pwsh.exe.exe bug)"
