@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+
+# Backup files
+**/*.rs.bk
+
+# Environment / secrets
+*.env
+.env.*
+secrets.*
+
+# Factory bookkeeping (never in product tree, but guard anyway)
+factory/runs/
+factory/checkpoints/
