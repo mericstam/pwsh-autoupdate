@@ -25,3 +25,20 @@ jobs:
         run: cargo build --release --verbose
       - name: test
         run: cargo test --verbose
+      - name: verify single binary (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: test -x target/release/pwsh-autoupdate
+      - name: verify single binary (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: test -x target/release/pwsh-autoupdate.exe
+
+  deny:
+    name: cargo-deny (licenses + advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses advisories

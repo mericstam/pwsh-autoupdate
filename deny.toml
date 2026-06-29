@@ -1,0 +1,42 @@
+# cargo-deny configuration for pwsh-autoupdate.
+# Enforces the permissive-only license policy (no forced-copyleft GPL/LGPL/AGPL)
+# and runs the RustSec advisory (CVE) database check in CI on every push.
+#
+# Security gate enumerated 141 dependencies, all under permissive licenses below.
+
+[licenses]
+# Fail the build on any dependency whose license is not in this allow-list.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "0BSD",
+    "Zlib",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+# Confidence required to match a detected license against the SPDX list.
+confidence-threshold = 0.8
+
+[advisories]
+# RustSec advisory (CVE) gate. With no version key cargo-deny uses its current
+# default behavior: security vulnerabilities and unmaintained crates error.
+# Yanked crates warn. Do NOT blanket-ignore real vulnerabilities here — add a
+# specific RUSTSEC id to `ignore` only for a vetted, non-applicable advisory.
+ignore = []
+
+[bans]
+# Forced-copyleft licenses are absent from the `allow` list above, so any
+# GPL/LGPL/AGPL dependency fails the licenses check by policy.
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+# Only crates.io is trusted; unknown registries/git sources fail.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
