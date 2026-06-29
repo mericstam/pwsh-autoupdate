@@ -144,6 +144,208 @@ fn plan_for(
     }
 }
 
+/// Best-effort check of whether the current process holds the elevated
+/// privileges a system-scope upgrade needs (FR-12). The tool NEVER self-elevates
+/// — it only reports the requirement when it is unmet.
+///
+/// On Unix this is "are we root (euid 0)?". On Windows there is no portable
+/// libc check without extra crates; conservatively report `false` so the host
+/// surfaces the requirement rather than silently attempting a privileged action
+/// it may not be allowed to perform.
+pub fn has_elevated_privileges() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` is always safe to call and has no preconditions.
+        unsafe { libc_geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
+}
+
+/// The default update path (FR-1/6/11/12; ADR-0001/0002).
+///
+/// Builds the real privilege check and delegates to [`run_update_with`]. This is
+/// the function `main.rs` calls; tests drive [`run_update_with`] with an injected
+/// `elevated` flag for determinism.
+pub fn run_update(
+    http: &dyn HttpClient,
+    runner: &dyn CommandRunner,
+    os: Os,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    run_update_with(http, runner, os, has_elevated_privileges(), out, err)
+}
+
+/// The update flow with the privilege state injected (testable).
+///
+/// Flow (design Section 7):
+/// 1. probe; pwsh absent → report not-installed, exit non-zero, no install
+///    (ADR-0001).
+/// 2. parse current version (honest error on failure).
+/// 3. resolve latest stable over HTTP; failure → exit non-zero, no fabricated
+///    version (FR-11).
+/// 4. up-to-date → exit 0 (no-op).
+/// 5. method undetermined → report, exit non-zero, attempt no update.
+/// 6. build the plan (same plan as `--check`, FR-9).
+/// 7. `requires_elevation && !elevated` → surface the requirement, exit
+///    non-zero, NEVER self-elevate (FR-12).
+/// 8. manager not on PATH → name it, exit non-zero, try no other channel (FR-6).
+/// 9. run the command (the ONLY mutating call); non-zero status → surface
+///    stderr, exit non-zero, never report success (FR-6).
+/// 10. success → exit 0.
+pub fn run_update_with(
+    http: &dyn HttpClient,
+    runner: &dyn CommandRunner,
+    os: Os,
+    elevated: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let signals = probe::probe(runner, os);
+
+    if !signals.pwsh_present {
+        let _ = writeln!(
+            err,
+            "error: PowerShell (pwsh) is not installed; nothing to update (this tool only updates an existing install)"
+        );
+        return EXIT_FAILURE;
+    }
+
+    let current = match signals.current_version.as_deref() {
+        Some(raw) => match version::parse(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return EXIT_FAILURE;
+            }
+        },
+        None => {
+            let _ = writeln!(
+                err,
+                "error: could not determine the installed PowerShell version"
+            );
+            return EXIT_FAILURE;
+        }
+    };
+
+    let detection = detect::resolve(os, &signals);
+
+    let latest = match resolve_latest_stable(http) {
+        Ok(info) => info,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return EXIT_FAILURE;
+        }
+    };
+
+    let state = version::classify(&current, &latest.version);
+    if state == VersionState::UpToDate {
+        let _ = writeln!(
+            out,
+            "PowerShell {current} is up to date (latest stable: {}). Nothing to do.",
+            latest.version
+        );
+        return EXIT_SUCCESS;
+    }
+
+    // Update is available — we need a determined method to proceed.
+    let method = match detection.selected {
+        Some(m) => m,
+        None => {
+            let _ = writeln!(
+                err,
+                "error: could not determine how PowerShell was installed; no upgrade command can be produced. Update PowerShell manually."
+            );
+            return EXIT_FAILURE;
+        }
+    };
+
+    let plan = match plan::build_plan(method, current.clone(), latest.version.clone(), os) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return EXIT_FAILURE;
+        }
+    };
+
+    // FR-12: surface a privilege requirement; never self-elevate.
+    if plan.requires_elevation && !elevated {
+        let _ = writeln!(
+            err,
+            "error: updating PowerShell via {} requires elevated privileges. Re-run with elevation (e.g. sudo / an elevated shell); this tool will not self-elevate.",
+            method.label()
+        );
+        return EXIT_FAILURE;
+    }
+
+    // FR-6: the owning manager must be on PATH; do not fall back to another channel.
+    if !runner.exists(&plan.program) {
+        let _ = writeln!(
+            err,
+            "error: the required package manager '{}' (owning channel: {}) was not found on PATH; not attempting any other channel.",
+            plan.program,
+            method.label()
+        );
+        return EXIT_FAILURE;
+    }
+
+    let cmd_display = if plan.args.is_empty() {
+        plan.program.clone()
+    } else {
+        format!("{} {}", plan.program, plan.args.join(" "))
+    };
+    let _ = writeln!(
+        out,
+        "Updating PowerShell {} -> {} via {} ...",
+        current,
+        latest.version,
+        method.label()
+    );
+    let _ = writeln!(out, "Running: {cmd_display}");
+
+    // The ONLY mutating call.
+    let arg_refs: Vec<&str> = plan.args.iter().map(String::as_str).collect();
+    match runner.run(&plan.program, &arg_refs) {
+        Ok(output) if output.status == 0 => {
+            let _ = writeln!(
+                out,
+                "PowerShell updated successfully to {}.",
+                latest.version
+            );
+            EXIT_SUCCESS
+        }
+        Ok(output) => {
+            // Non-zero manager exit: surface stderr, NEVER report success (FR-6).
+            let _ = writeln!(
+                err,
+                "error: '{}' exited with status {}.",
+                plan.program, output.status
+            );
+            if !output.stderr.trim().is_empty() {
+                let _ = writeln!(err, "{}", output.stderr.trim_end());
+            }
+            EXIT_FAILURE
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "error: failed to run '{}': {e}. PowerShell was not updated.",
+                plan.program
+            );
+            EXIT_FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,8 +406,20 @@ mod tests {
         present: HashSet<String>,
         outputs: HashMap<String, crate::adapters::runner::CmdOutput>,
         runs: RefCell<Vec<(String, Vec<String>)>>,
+        /// When set, a mutating (upgrade/refresh/install) invocation returns this
+        /// non-zero status with the given stderr — modelling a manager failure
+        /// while leaving the read-only probe list-queries succeeding.
+        fail_upgrade: Option<(i32, String)>,
+    }
+    fn is_mutating_args(args: &[&str]) -> bool {
+        args.iter()
+            .any(|a| *a == "upgrade" || *a == "refresh" || *a == "install")
     }
     impl FakeRunner {
+        fn fail_upgrade(mut self, status: i32, stderr: &str) -> Self {
+            self.fail_upgrade = Some((status, stderr.to_string()));
+            self
+        }
         fn pwsh(version_line: &str) -> Self {
             let mut r = Self::default();
             let exe = probe::pwsh_exe().to_string();
@@ -243,6 +457,15 @@ mod tests {
                 program.to_string(),
                 args.iter().map(|s| s.to_string()).collect(),
             ));
+            if let Some((status, stderr)) = &self.fail_upgrade {
+                if is_mutating_args(args) {
+                    return Ok(crate::adapters::runner::CmdOutput {
+                        status: *status,
+                        stdout: String::new(),
+                        stderr: stderr.clone(),
+                    });
+                }
+            }
             self.outputs.get(program).cloned().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, format!("no fake: {program}"))
             })
@@ -383,5 +606,138 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(p.program, "apt-get");
+    }
+
+    // --- run_update path ----------------------------------------------------
+
+    #[test]
+    fn update_runs_detected_command_and_exits_0_on_success() {
+        // macOS Homebrew: no elevation required; happy path.
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0").with_manager("brew", "powershell");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Macos, false, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(stdout.contains("updated successfully"));
+        // The exact detected command ran (FR-9 agreement: brew upgrade powershell).
+        let muts = mutating_runs(&runner);
+        assert_eq!(
+            muts,
+            vec![(
+                "brew".to_string(),
+                vec!["upgrade".to_string(), "powershell".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn update_up_to_date_is_noop_exit_0_no_mutation() {
+        let http = FakeHttp::ok("7.4.0");
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0").with_manager("brew", "powershell");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Macos, false, &mut out, &mut err);
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(String::from_utf8(out).unwrap().contains("up to date"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn update_manager_nonzero_exit_surfaces_failure_never_success() {
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("brew", "powershell")
+            .fail_upgrade(1, "brew: upgrade failed: locked");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Macos, false, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(!stdout.contains("updated successfully"));
+        assert!(stderr.contains("exited with status 1"));
+        assert!(stderr.contains("upgrade failed"));
+    }
+
+    #[test]
+    fn update_manager_missing_on_path_names_it_and_exits_nonzero() {
+        // dpkg owns pwsh (detected) but apt-get is not on PATH.
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("dpkg", "Package: powershell\nStatus: install ok installed");
+        // apt-get is the plan program and is NOT present -> not on PATH.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        // elevated=true so the elevation gate does not trip first.
+        let code = run_update_with(&http, &runner, Os::Linux, true, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(stderr.contains("apt-get"));
+        assert!(stderr.contains("not found on PATH"));
+        assert!(stderr.contains("not attempting any other channel"));
+        assert!(
+            mutating_runs(&runner).is_empty(),
+            "must not run the upgrade"
+        );
+    }
+
+    #[test]
+    fn update_elevation_required_but_absent_surfaces_and_exits_nonzero() {
+        // Linux apt requires elevation; not elevated -> surface, no self-elevate.
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("dpkg", "Package: powershell\nStatus: install ok installed")
+            .with_manager("apt-get", "");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Linux, false, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(stderr.contains("elevated privileges"));
+        assert!(stderr.contains("will not self-elevate"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn update_undetermined_method_exits_nonzero_no_action() {
+        // pwsh present, update available, but no manager owns it.
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Linux, true, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(stderr.contains("could not determine how PowerShell was installed"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn update_pwsh_absent_exits_nonzero_without_installing() {
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::default();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Linux, false, &mut out, &mut err);
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(String::from_utf8(err).unwrap().contains("not installed"));
+        assert!(runner.runs.borrow().is_empty());
+    }
+
+    #[test]
+    fn update_source_failure_exits_nonzero_no_fabricated_version() {
+        let http = FakeHttp::failing();
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0").with_manager("brew", "powershell");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Macos, false, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(!stdout.contains("Latest"));
+        assert!(!stderr.contains("Latest version"));
+        assert!(mutating_runs(&runner).is_empty());
     }
 }

@@ -37,9 +37,7 @@ fn main() -> ExitCode {
     let code = if cli.check {
         app::run_check(&http, &runner, os, &mut stdout, &mut stderr)
     } else {
-        // The default update path is wired on the same host chain (cli-wiring-update).
-        eprintln!("error: the update path is not yet wired in this build; use --check");
-        EXIT_FAILURE
+        app::run_update(&http, &runner, os, &mut stdout, &mut stderr)
     };
 
     ExitCode::from(code as u8)
