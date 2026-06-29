@@ -107,13 +107,11 @@ fn check_against_mock_http_server_uses_real_http_path() {
         "unexpected --check exit code {code}; stdout={stdout:?} stderr={stderr:?}"
     );
 
-    // The build-info feed (mock) MUST have been hit by the real HTTP path; this
-    // is what makes the test fail if the production HTTP path were bypassed.
-    build_info.assert();
-
     if code == 2 {
         // Host lacks a usable pwsh (or version is unparseable): an honest error,
-        // and crucially NO fabricated "Latest version" anywhere (FR-11).
+        // and crucially NO fabricated "Latest version" anywhere (FR-11). The
+        // build-info feed is legitimately NOT consulted on this early-exit path,
+        // so it is not asserted here (keeps the test robust on a pwsh-less host).
         assert!(
             stderr.contains("error:"),
             "exit 2 must surface an honest error; stderr={stderr:?}"
@@ -126,6 +124,10 @@ fn check_against_mock_http_server_uses_real_http_path() {
         // pwsh present: the report carries the HTTP-RESOLVED latest version. This
         // value only exists because the real RealHttp -> resolve path ran against
         // the mock server — deleting that path makes this line disappear.
+        //
+        // The build-info feed MUST have been hit by the real HTTP path; this is
+        // what makes the test fail if the production HTTP path were bypassed.
+        build_info.assert();
         assert!(
             stdout.contains("Latest version:  7.6.99"),
             "expected the mock-resolved latest version in the report; stdout={stdout:?}"

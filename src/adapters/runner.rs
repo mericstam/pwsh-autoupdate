@@ -19,6 +19,13 @@ pub trait CommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> std::io::Result<CmdOutput>;
     /// Is the program resolvable on PATH? Used before running a plan's command.
     fn exists(&self, program: &str) -> bool;
+    /// Does a directory exist on the host filesystem? The only filesystem stat
+    /// the probe needs (portable-install prefix detection). Defaults to `false`
+    /// so test fakes are hermetic by construction — only `RealRunner` reaches
+    /// the disk. Fakes that need to model a portable install override this.
+    fn dir_exists(&self, _path: &str) -> bool {
+        false
+    }
 }
 
 /// Real runner over `std::process::Command`, confined to the adapter layer.
@@ -42,10 +49,22 @@ impl CommandRunner for RealRunner {
         let Some(path) = std::env::var_os("PATH") else {
             return false;
         };
-        std::env::split_paths(&path).any(|dir| {
-            let candidate = dir.join(format!("{program}{}", std::env::consts::EXE_SUFFIX));
-            candidate.is_file()
-        })
+        // Only append the platform suffix when the name doesn't already carry
+        // it: callers pass bare manager names ("winget") but also the resolved
+        // PowerShell exe ("pwsh.exe" on Windows). Blindly appending would look
+        // for "pwsh.exe.exe" and never find a real pwsh on Windows.
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let already_suffixed = !suffix.is_empty() && program.to_ascii_lowercase().ends_with(suffix);
+        let filename = if already_suffixed {
+            program.to_string()
+        } else {
+            format!("{program}{suffix}")
+        };
+        std::env::split_paths(&path).any(|dir| dir.join(&filename).is_file())
+    }
+
+    fn dir_exists(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_dir()
     }
 }
 
@@ -175,5 +194,43 @@ mod tests {
 
         assert!(found, "real exists() should locate a file on PATH");
         assert!(!missing, "real exists() should not find an absent program");
+    }
+
+    #[test]
+    fn real_runner_exists_accepts_already_suffixed_name() {
+        // On Windows the probe asks for the resolved exe ("pwsh.exe"); exists()
+        // must not append a second ".exe". The on-disk file is "<name><suffix>",
+        // and BOTH the bare and the already-suffixed lookups must find it. On
+        // Unix EXE_SUFFIX is empty, so the two forms coincide and still pass.
+        let dir = tempfile::tempdir().unwrap();
+        let name = "psautoupdater-fake-pwsh";
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let on_disk = format!("{name}{suffix}");
+        std::fs::write(dir.path().join(&on_disk), b"#!/bin/sh\n").unwrap();
+
+        let prev = std::env::var_os("PATH");
+        let mut paths: Vec<std::path::PathBuf> = prev
+            .as_ref()
+            .map(|p| std::env::split_paths(p).collect())
+            .unwrap_or_default();
+        paths.insert(0, dir.path().to_path_buf());
+        let joined = std::env::join_paths(&paths).unwrap();
+        // SAFETY: single-threaded test; PATH is restored before returning.
+        std::env::set_var("PATH", &joined);
+
+        let runner = RealRunner;
+        let bare = runner.exists(name);
+        let suffixed = runner.exists(&on_disk);
+
+        match prev {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert!(bare, "bare name should resolve with the platform suffix");
+        assert!(
+            suffixed,
+            "already-suffixed name must not be double-suffixed (pwsh.exe.exe bug)"
+        );
     }
 }
