@@ -36,7 +36,9 @@ impl CommandRunner for RealRunner {
 
     fn exists(&self, program: &str) -> bool {
         // Resolve on PATH without running the program: probe each PATH entry
-        // for an executable file with the program's name (+ EXE suffix).
+        // for an executable file with the program's name (+ EXE suffix). Using
+        // the platform `EXE_SUFFIX` keeps lookup correct on Windows (`.exe`)
+        // vs Unix (empty) by construction.
         let Some(path) = std::env::var_os("PATH") else {
             return false;
         };
@@ -44,5 +46,134 @@ impl CommandRunner for RealRunner {
             let candidate = dir.join(format!("{program}{}", std::env::consts::EXE_SUFFIX));
             candidate.is_file()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Recording fake: returns canned `CmdOutput` per program and records every
+    /// invocation. Models a non-zero manager exit and "off PATH" via `present`.
+    #[derive(Default)]
+    pub struct FakeRunner {
+        pub canned: std::collections::HashMap<String, CmdOutput>,
+        pub present: std::collections::HashSet<String>,
+        pub calls: RefCell<Vec<(String, Vec<String>)>>,
+    }
+
+    impl FakeRunner {
+        fn with_output(program: &str, out: CmdOutput) -> Self {
+            let mut canned = std::collections::HashMap::new();
+            canned.insert(program.to_string(), out);
+            let mut present = std::collections::HashSet::new();
+            present.insert(program.to_string());
+            Self {
+                canned,
+                present,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<CmdOutput> {
+            self.calls.borrow_mut().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            ));
+            self.canned.get(program).cloned().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, format!("no fake: {program}"))
+            })
+        }
+        fn exists(&self, program: &str) -> bool {
+            self.present.contains(program)
+        }
+    }
+
+    #[test]
+    fn records_invocation_and_returns_canned_output() {
+        let runner = FakeRunner::with_output(
+            "winget",
+            CmdOutput {
+                status: 0,
+                stdout: "ok".into(),
+                stderr: String::new(),
+            },
+        );
+        let out = runner
+            .run("winget", &["upgrade", "--id", "Microsoft.PowerShell"])
+            .unwrap();
+        assert_eq!(out.status, 0);
+        assert_eq!(out.stdout, "ok");
+        assert_eq!(
+            runner.calls.borrow().as_slice(),
+            &[(
+                "winget".to_string(),
+                vec![
+                    "upgrade".to_string(),
+                    "--id".to_string(),
+                    "Microsoft.PowerShell".to_string()
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_is_representable_as_surfaced_failure_not_success() {
+        // A manager that exits non-zero is captured (status != 0) so the host
+        // can surface a failure and never report success (FR-6/FR-12).
+        let runner = FakeRunner::with_output(
+            "apt-get",
+            CmdOutput {
+                status: 100,
+                stdout: String::new(),
+                stderr: "E: Unable to locate package".into(),
+            },
+        );
+        let out = runner.run("apt-get", &["install", "powershell"]).unwrap();
+        assert_ne!(out.status, 0);
+        assert!(out.stderr.contains("Unable to locate package"));
+    }
+
+    #[test]
+    fn exists_models_manager_off_path() {
+        let runner = FakeRunner::default();
+        assert!(!runner.exists("brew"));
+    }
+
+    #[test]
+    fn real_runner_exists_finds_executable_on_path() {
+        // Drive the real PATH-lookup logic with a temp dir on PATH holding a
+        // file named like the program (+ platform EXE suffix). No subprocess.
+        let dir = tempfile::tempdir().unwrap();
+        let name = "psautoupdater-fake-mgr";
+        let file = dir
+            .path()
+            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+
+        let prev = std::env::var_os("PATH");
+        let mut paths: Vec<std::path::PathBuf> = prev
+            .as_ref()
+            .map(|p| std::env::split_paths(p).collect())
+            .unwrap_or_default();
+        paths.insert(0, dir.path().to_path_buf());
+        let joined = std::env::join_paths(&paths).unwrap();
+        // SAFETY: single-threaded test; PATH is restored before returning.
+        std::env::set_var("PATH", &joined);
+
+        let runner = RealRunner;
+        let found = runner.exists(name);
+        let missing = runner.exists("psautoupdater-definitely-absent-xyz");
+
+        match prev {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert!(found, "real exists() should locate a file on PATH");
+        assert!(!missing, "real exists() should not find an absent program");
     }
 }
