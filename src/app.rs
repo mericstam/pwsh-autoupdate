@@ -324,7 +324,32 @@ pub fn run_update_with(
             EXIT_SUCCESS
         }
         Ok(output) => {
-            // Non-zero manager exit: surface stderr, NEVER report success (FR-6).
+            // Non-zero manager exit. Some managers (notably winget) return a
+            // non-zero status even when the upgrade was actually applied — e.g.
+            // the package being upgraded is the running shell, or a follow-up
+            // invocation finds "no applicable upgrade" because the work is
+            // already done. We must still NEVER report success on a real failure
+            // (FR-6), so we do not trust the exit code in *either* direction:
+            // re-probe the installed version and report success only if
+            // PowerShell is now actually at (or above) the target version.
+            let reprobed = probe::probe(runner, os);
+            let verified = reprobed
+                .current_version
+                .as_deref()
+                .and_then(|raw| version::parse(raw).ok())
+                .map(|now| version::classify(&now, &latest.version) == VersionState::UpToDate)
+                .unwrap_or(false);
+
+            if verified {
+                let _ = writeln!(
+                    out,
+                    "PowerShell updated successfully to {} ('{}' exited with status {}, but the installed version now matches the target).",
+                    latest.version, plan.program, output.status
+                );
+                return EXIT_SUCCESS;
+            }
+
+            // Genuine failure: surface stderr, NEVER report success (FR-6).
             let _ = writeln!(
                 err,
                 "error: '{}' exited with status {}.",
@@ -410,6 +435,10 @@ mod tests {
         /// non-zero status with the given stderr — modelling a manager failure
         /// while leaving the read-only probe list-queries succeeding.
         fail_upgrade: Option<(i32, String)>,
+        /// When set, `pwsh --version` returns this line *after* a mutating
+        /// invocation has run — modelling a manager that applied the upgrade
+        /// (so a re-probe sees the new version) even if it exited non-zero.
+        post_upgrade_version: Option<String>,
     }
     fn is_mutating_args(args: &[&str]) -> bool {
         args.iter()
@@ -418,6 +447,11 @@ mod tests {
     impl FakeRunner {
         fn fail_upgrade(mut self, status: i32, stderr: &str) -> Self {
             self.fail_upgrade = Some((status, stderr.to_string()));
+            self
+        }
+        /// After any mutating call, `pwsh --version` reports `version_line`.
+        fn upgrades_to(mut self, version_line: &str) -> Self {
+            self.post_upgrade_version = Some(version_line.to_string());
             self
         }
         fn pwsh(version_line: &str) -> Self {
@@ -457,6 +491,24 @@ mod tests {
                 program.to_string(),
                 args.iter().map(|s| s.to_string()).collect(),
             ));
+            // Model a manager that actually applied the upgrade: once a mutating
+            // call has run, a re-probe of `pwsh --version` sees the new version.
+            if let Some(newv) = &self.post_upgrade_version {
+                let exe = probe::pwsh_exe();
+                if program == exe && args == ["--version"] {
+                    let upgraded = self.runs.borrow().iter().any(|(_, a)| {
+                        let refs: Vec<&str> = a.iter().map(String::as_str).collect();
+                        is_mutating_args(&refs)
+                    });
+                    if upgraded {
+                        return Ok(crate::adapters::runner::CmdOutput {
+                            status: 0,
+                            stdout: newv.clone(),
+                            stderr: String::new(),
+                        });
+                    }
+                }
+            }
             if let Some((status, stderr)) = &self.fail_upgrade {
                 if is_mutating_args(args) {
                     return Ok(crate::adapters::runner::CmdOutput {
@@ -659,6 +711,49 @@ mod tests {
         assert!(!stdout.contains("updated successfully"));
         assert!(stderr.contains("exited with status 1"));
         assert!(stderr.contains("upgrade failed"));
+    }
+
+    #[test]
+    fn update_nonzero_exit_but_version_now_at_target_reports_success() {
+        // winget commonly exits non-zero even when the upgrade was applied (e.g.
+        // the upgraded package is the running shell). If a re-probe shows the
+        // installed version is now at the target, this is a success, not a
+        // failure — we verify the actual outcome rather than trusting the code.
+        let http = FakeHttp::ok("7.6.3");
+        let runner = FakeRunner::pwsh("PowerShell 7.6.1")
+            .with_manager("winget", "Microsoft.PowerShell 7.6.1")
+            .fail_upgrade(-1978335189, "No available upgrade found.")
+            .upgrades_to("PowerShell 7.6.3");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Windows, true, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(stdout.contains("updated successfully to 7.6.3"));
+        // The non-zero status is surfaced for transparency, but not as an error.
+        assert!(!stderr.contains("error:"));
+        // The upgrade really was attempted.
+        assert!(!mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn update_nonzero_exit_and_version_unchanged_still_fails() {
+        // Same non-zero exit, but the version did NOT advance -> genuine failure
+        // (FR-6: never report success on a real failure).
+        let http = FakeHttp::ok("7.6.3");
+        let runner = FakeRunner::pwsh("PowerShell 7.6.1")
+            .with_manager("winget", "Microsoft.PowerShell 7.6.1")
+            .fail_upgrade(-1978335189, "Installer failed.");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Windows, true, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(!stdout.contains("updated successfully"));
+        assert!(stderr.contains("error:"));
+        assert!(stderr.contains("Installer failed."));
     }
 
     #[test]
