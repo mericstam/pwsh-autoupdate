@@ -26,6 +26,26 @@ pub trait CommandRunner {
     fn dir_exists(&self, _path: &str) -> bool {
         false
     }
+    /// Resolve a program on PATH to its canonical, symlink-followed absolute
+    /// path (e.g. `~/.local/bin/pwsh` -> `~/.local/share/powershell/7.6.2/pwsh`),
+    /// or `None` if not found. Lets the probe recognize a user-local / manual
+    /// portable install from where the real binary lives. Defaults to `None` so
+    /// fakes are hermetic by construction; only `RealRunner` touches the disk.
+    fn resolve_program_path(&self, _program: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Platform executable filename for a program name: append `EXE_SUFFIX` only
+/// when it is not already present, so "pwsh.exe" does not become "pwsh.exe.exe"
+/// on Windows while a bare "winget" still becomes "winget.exe".
+fn exe_filename(program: &str) -> String {
+    let suffix = std::env::consts::EXE_SUFFIX;
+    if !suffix.is_empty() && program.to_ascii_lowercase().ends_with(suffix) {
+        program.to_string()
+    } else {
+        format!("{program}{suffix}")
+    }
 }
 
 /// Real runner over `std::process::Command`, confined to the adapter layer.
@@ -49,22 +69,24 @@ impl CommandRunner for RealRunner {
         let Some(path) = std::env::var_os("PATH") else {
             return false;
         };
-        // Only append the platform suffix when the name doesn't already carry
-        // it: callers pass bare manager names ("winget") but also the resolved
-        // PowerShell exe ("pwsh.exe" on Windows). Blindly appending would look
-        // for "pwsh.exe.exe" and never find a real pwsh on Windows.
-        let suffix = std::env::consts::EXE_SUFFIX;
-        let already_suffixed = !suffix.is_empty() && program.to_ascii_lowercase().ends_with(suffix);
-        let filename = if already_suffixed {
-            program.to_string()
-        } else {
-            format!("{program}{suffix}")
-        };
+        // `exe_filename` appends the platform suffix only when absent, so a
+        // resolved "pwsh.exe" is not looked up as "pwsh.exe.exe" on Windows.
+        let filename = exe_filename(program);
         std::env::split_paths(&path).any(|dir| dir.join(&filename).is_file())
     }
 
     fn dir_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).is_dir()
+    }
+
+    fn resolve_program_path(&self, program: &str) -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        let filename = exe_filename(program);
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(&filename))
+            .find(|candidate| candidate.is_file())
+            .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+            .map(|resolved| resolved.to_string_lossy().into_owned())
     }
 }
 
@@ -193,6 +215,11 @@ mod tests {
         // NOT be double-suffixed into "pwsh.exe.exe". On Unix EXE_SUFFIX is empty
         // so this coincides with the bare lookup.
         let suffixed = runner.exists(&on_disk);
+        // resolve_program_path returns the canonical on-disk path (PATH lookup +
+        // canonicalize); compare against the canonicalized expected file.
+        let resolved = runner.resolve_program_path(name);
+        let resolved_missing = runner.resolve_program_path("psautoupdater-definitely-absent-xyz");
+        let expected = std::fs::canonicalize(dir.path().join(&on_disk)).unwrap();
 
         match prev {
             Some(p) => std::env::set_var("PATH", p),
@@ -204,6 +231,15 @@ mod tests {
         assert!(
             suffixed,
             "already-suffixed name must not be double-suffixed (pwsh.exe.exe bug)"
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some(expected.to_string_lossy().as_ref()),
+            "resolve_program_path should return the canonical on-disk path"
+        );
+        assert!(
+            resolved_missing.is_none(),
+            "resolve_program_path returns None for an absent program"
         );
     }
 }
