@@ -59,10 +59,13 @@ pub fn probe(runner: &dyn CommandRunner, os: Os) -> DetectionSignals {
         ..Default::default()
     };
 
-    // Ownership probing only makes sense when pwsh is installed.
-    if pwsh_present {
-        gather_ownership(runner, os, &mut signals);
-    }
+    // Always enumerate the per-OS managers. When pwsh is present this fills the
+    // ownership hints used to pick the *update* channel; when pwsh is ABSENT the
+    // ownership queries simply report not-owned, but `available_managers` is
+    // still populated so the host can pick a from-scratch *install* channel
+    // (ADR-0006). Portable detection resolves the real binary path, which is
+    // `None` when pwsh is absent, so no portable hint is set in that case.
+    gather_ownership(runner, os, &mut signals);
 
     signals
 }
