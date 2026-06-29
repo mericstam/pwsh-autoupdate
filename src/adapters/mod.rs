@@ -16,9 +16,7 @@ pub mod http;
 pub mod probe;
 pub mod runner;
 
-use crate::adapters::http::{
-    BuildInfo, GitHubRelease, HttpClient, BUILD_INFO_STABLE_URL, GITHUB_RELEASES_LATEST_URL,
-};
+use crate::adapters::http::{build_info_url, releases_url, BuildInfo, GitHubRelease, HttpClient};
 use crate::core::error::{CoreError, SourceError};
 use crate::core::{version, ReleaseInfo};
 
@@ -38,7 +36,10 @@ use crate::core::{version, ReleaseInfo};
 /// makes a fabricated "latest" unrepresentable on the error path.
 pub fn resolve_latest_stable(http: &dyn HttpClient) -> Result<ReleaseInfo, CoreError> {
     // --- 1. build-info stable anchor ---------------------------------------
-    let build_info_body = http.get_text(BUILD_INFO_STABLE_URL)?;
+    // The effective URLs default to the real pinned sources; an opt-in test seam
+    // (env override) lets integration tests redirect this REAL path at a mock
+    // server without changing production behavior.
+    let build_info_body = http.get_text(&build_info_url())?;
     let build_info = BuildInfo::from_text(&build_info_body)?;
     let anchor_tag = build_info.release_tag.trim().to_string();
     if anchor_tag.is_empty() {
@@ -51,7 +52,7 @@ pub fn resolve_latest_stable(http: &dyn HttpClient) -> Result<ReleaseInfo, CoreE
     // cross-check the anchor. Per ADR-0003 the build-info `ReleaseTag` is the
     // canonical stable floor: a prerelease GitHub "latest" is ignored
     // (stable-only) and never downgrades below the anchor.
-    let release_value = http.get_json(GITHUB_RELEASES_LATEST_URL)?;
+    let release_value = http.get_json(&releases_url())?;
     let release: GitHubRelease =
         serde_json::from_value(release_value).map_err(|e| SourceError::Parse(e.to_string()))?;
 
@@ -80,6 +81,7 @@ pub fn resolve_latest_stable(http: &dyn HttpClient) -> Result<ReleaseInfo, CoreE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::http::{BUILD_INFO_STABLE_URL, GITHUB_RELEASES_LATEST_URL};
     use std::collections::HashMap;
 
     /// In-memory fake: maps URL -> recorded body, or a forced fetch error.
