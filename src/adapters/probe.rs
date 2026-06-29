@@ -173,10 +173,13 @@ fn gather_linux(runner: &dyn CommandRunner, signals: &mut DetectionSignals) {
     }
     // Portable tar.gz: pwsh living under a non-package-managed prefix and owned
     // by no manager above. If pwsh is present but no native/snap manager claimed
-    // it, treat the common portable install prefix as the location hint.
+    // it, treat the common portable install prefix as the location hint. The
+    // directory stat goes through the runner seam (not `std::path` directly) so
+    // detection stays hermetic — otherwise a real pwsh at this prefix on the
+    // host (e.g. a CI runner) leaks into fake-driven unit tests.
     if !signals.dpkg_owns_pwsh && !signals.rpm_owns_pwsh && !signals.snap_lists_pwsh {
         const PORTABLE_PREFIX: &str = "/opt/microsoft/powershell";
-        if std::path::Path::new(PORTABLE_PREFIX).is_dir() {
+        if runner.dir_exists(PORTABLE_PREFIX) {
             signals.portable_install_dir = Some(PORTABLE_PREFIX.to_string());
         }
     }
@@ -194,6 +197,7 @@ mod tests {
     struct FakeRunner {
         present: HashSet<String>,
         outputs: HashMap<String, CmdOutput>,
+        dirs: HashSet<String>,
     }
 
     impl FakeRunner {
@@ -213,6 +217,11 @@ mod tests {
             );
             self
         }
+        /// Model a directory existing on the (fake) filesystem.
+        fn dir(mut self, path: &str) -> Self {
+            self.dirs.insert(path.to_string());
+            self
+        }
     }
 
     impl CommandRunner for FakeRunner {
@@ -223,6 +232,9 @@ mod tests {
         }
         fn exists(&self, program: &str) -> bool {
             self.present.contains(program)
+        }
+        fn dir_exists(&self, path: &str) -> bool {
+            self.dirs.contains(path)
         }
     }
 
@@ -327,6 +339,32 @@ mod tests {
         let s = probe(&runner, Os::Windows);
         assert!(s.winget_lists_pwsh);
         assert!(s.available_managers.contains(&InstallMethod::Winget));
+    }
+
+    #[test]
+    fn linux_portable_prefix_detected_via_runner_seam() {
+        // pwsh present, no manager owns it, but the portable prefix dir exists
+        // (modelled on the fake) -> location hint recorded, method undetermined.
+        let exe = pwsh_exe();
+        let runner = FakeRunner::default()
+            .output(exe, 0, "PowerShell 7.4.6")
+            .dir("/opt/microsoft/powershell");
+        let s = probe(&runner, Os::Linux);
+        assert_eq!(
+            s.portable_install_dir.as_deref(),
+            Some("/opt/microsoft/powershell")
+        );
+        assert!(!s.dpkg_owns_pwsh && !s.rpm_owns_pwsh && !s.snap_lists_pwsh);
+    }
+
+    #[test]
+    fn linux_portable_prefix_is_hermetic_when_dir_absent() {
+        // No manager owns pwsh and the fake reports no portable dir -> no host
+        // leakage even if the real machine has /opt/microsoft/powershell.
+        let exe = pwsh_exe();
+        let runner = FakeRunner::default().output(exe, 0, "PowerShell 7.4.6");
+        let s = probe(&runner, Os::Linux);
+        assert!(s.portable_install_dir.is_none());
     }
 
     #[test]
