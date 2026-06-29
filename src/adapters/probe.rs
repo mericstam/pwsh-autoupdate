@@ -171,18 +171,52 @@ fn gather_linux(runner: &dyn CommandRunner, signals: &mut DetectionSignals) {
     if note_manager(runner, "snap", InstallMethod::Snap, signals) {
         signals.snap_lists_pwsh = manager_lists_pwsh(runner, "snap", &["list", "powershell"]);
     }
-    // Portable tar.gz: pwsh living under a non-package-managed prefix and owned
-    // by no manager above. If pwsh is present but no native/snap manager claimed
-    // it, treat the common portable install prefix as the location hint. The
-    // directory stat goes through the runner seam (not `std::path` directly) so
-    // detection stays hermetic — otherwise a real pwsh at this prefix on the
-    // host (e.g. a CI runner) leaks into fake-driven unit tests.
+    // Portable tar.gz: pwsh owned by no native/snap manager above. Recognize
+    // both a system-prefix install AND a user-local / manual extraction by
+    // resolving where the real binary lives. The dir stat and path resolution
+    // go through the runner seam (not `std` directly) so detection stays
+    // hermetic — otherwise a real pwsh on the host (e.g. a CI runner) leaks
+    // into fake-driven unit tests.
     if !signals.dpkg_owns_pwsh && !signals.rpm_owns_pwsh && !signals.snap_lists_pwsh {
-        const PORTABLE_PREFIX: &str = "/opt/microsoft/powershell";
-        if runner.dir_exists(PORTABLE_PREFIX) {
-            signals.portable_install_dir = Some(PORTABLE_PREFIX.to_string());
-        }
+        signals.portable_install_dir = portable_root_for(runner);
     }
+}
+
+/// Resolve the portable install root for pwsh, if any. Checks the system prefix
+/// first (a root `/opt/microsoft/powershell` install), then resolves the real
+/// binary path to recognize a user-local / manual extraction such as
+/// `~/.local/share/powershell/<version>/pwsh`. Both go through the runner seam.
+fn portable_root_for(runner: &dyn CommandRunner) -> Option<String> {
+    const SYSTEM_PREFIX: &str = "/opt/microsoft/powershell";
+    if runner.dir_exists(SYSTEM_PREFIX) {
+        return Some(SYSTEM_PREFIX.to_string());
+    }
+    let resolved = runner.resolve_program_path(pwsh_exe())?;
+    portable_root_from_path(&resolved)
+}
+
+/// Given the resolved pwsh binary path, return the portable install root if the
+/// binary lives under a `.../powershell[/<version>]/pwsh` tree (the layout of a
+/// manual tar.gz / user-local extraction). Pure: no IO, so it unit-tests on any
+/// OS. Returns `None` for any other location (kept "undetermined" — never guess).
+fn portable_root_from_path(binary: &str) -> Option<String> {
+    let parent = std::path::Path::new(binary).parent()?;
+    let is_powershell_dir = |dir: &std::path::Path| {
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("powershell"))
+    };
+    // Layout A: <root=powershell>/pwsh  (binary directly in a `powershell` dir).
+    if is_powershell_dir(parent) {
+        return Some(parent.to_string_lossy().into_owned());
+    }
+    // Layout B: <root=powershell>/<version>/pwsh  (versioned subdir — the common
+    // `~/.local/share/powershell/7.6.2/pwsh` and `/opt/microsoft/powershell/7`).
+    let grandparent = parent.parent()?;
+    if is_powershell_dir(grandparent) {
+        return Some(grandparent.to_string_lossy().into_owned());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -198,6 +232,7 @@ mod tests {
         present: HashSet<String>,
         outputs: HashMap<String, CmdOutput>,
         dirs: HashSet<String>,
+        resolved: Option<String>,
     }
 
     impl FakeRunner {
@@ -222,6 +257,11 @@ mod tests {
             self.dirs.insert(path.to_string());
             self
         }
+        /// Model the resolved (symlink-followed) path of the pwsh binary.
+        fn resolved_path(mut self, path: &str) -> Self {
+            self.resolved = Some(path.to_string());
+            self
+        }
     }
 
     impl CommandRunner for FakeRunner {
@@ -235,6 +275,9 @@ mod tests {
         }
         fn dir_exists(&self, path: &str) -> bool {
             self.dirs.contains(path)
+        }
+        fn resolve_program_path(&self, _program: &str) -> Option<String> {
+            self.resolved.clone()
         }
     }
 
@@ -359,12 +402,54 @@ mod tests {
 
     #[test]
     fn linux_portable_prefix_is_hermetic_when_dir_absent() {
-        // No manager owns pwsh and the fake reports no portable dir -> no host
-        // leakage even if the real machine has /opt/microsoft/powershell.
+        // No manager owns pwsh and the fake reports no portable dir / no resolved
+        // path -> no host leakage even if the real machine has a portable pwsh.
         let exe = pwsh_exe();
         let runner = FakeRunner::default().output(exe, 0, "PowerShell 7.4.6");
         let s = probe(&runner, Os::Linux);
         assert!(s.portable_install_dir.is_none());
+    }
+
+    #[test]
+    fn linux_user_local_portable_detected_from_resolved_path() {
+        // pwsh present, no manager owns it, no system prefix dir — but the real
+        // binary resolves under ~/.local/share/powershell/<ver>/pwsh. Detection
+        // must recognize this as a portable install (the bug: it was reporting
+        // "undetermined" for a fully-supported method).
+        let exe = pwsh_exe();
+        let runner = FakeRunner::default()
+            .output(exe, 0, "PowerShell 7.6.2")
+            .resolved_path("/home/u/.local/share/powershell/7.6.2/pwsh");
+        let s = probe(&runner, Os::Linux);
+        assert_eq!(
+            s.portable_install_dir.as_deref(),
+            Some("/home/u/.local/share/powershell")
+        );
+        // The pure rules then select PortableTarGz from these plain signals.
+        let d = crate::core::detect::resolve(Os::Linux, &s);
+        assert_eq!(d.selected, Some(InstallMethod::PortableTarGz));
+    }
+
+    #[test]
+    fn portable_root_from_path_recognizes_known_layouts() {
+        // Versioned subdir (user-local and system).
+        assert_eq!(
+            portable_root_from_path("/home/u/.local/share/powershell/7.6.2/pwsh").as_deref(),
+            Some("/home/u/.local/share/powershell")
+        );
+        assert_eq!(
+            portable_root_from_path("/opt/microsoft/powershell/7/pwsh").as_deref(),
+            Some("/opt/microsoft/powershell")
+        );
+        // Binary directly inside a `powershell` dir.
+        assert_eq!(
+            portable_root_from_path("/home/u/powershell/pwsh").as_deref(),
+            Some("/home/u/powershell")
+        );
+        // Unrelated locations stay undetermined — never guess.
+        assert!(portable_root_from_path("/usr/bin/pwsh").is_none());
+        assert!(portable_root_from_path("/home/u/.dotnet/tools/pwsh").is_none());
+        assert!(portable_root_from_path("pwsh").is_none());
     }
 
     #[test]
