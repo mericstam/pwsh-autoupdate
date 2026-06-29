@@ -14,12 +14,48 @@
 use crate::core::error::SourceError;
 use serde::Deserialize;
 
-/// GitHub Releases "latest" API for PowerShell (FR-2).
+/// GitHub Releases "latest" API for PowerShell (FR-2). This is the REAL pinned
+/// production URL and the default used when the override env var is unset.
 pub const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/PowerShell/PowerShell/releases/latest";
 
 /// Stable build-info feed (ADR-0003 anchor, cross-checked with the GitHub tag).
+/// REAL pinned production URL and default when the override env var is unset.
 pub const BUILD_INFO_STABLE_URL: &str = "https://aka.ms/pwsh-buildinfo-stable";
+
+/// Env var that overrides the GitHub Releases "latest" source URL.
+/// **Test-only seam:** unset in production (the default below is the real pinned
+/// URL), it lets integration tests point the REAL `RealHttp` path at an
+/// in-process mock HTTP server. It does NOT change production behavior and does
+/// NOT weaken FR-11 — a failed fetch against whatever URL is in effect still
+/// surfaces a [`SourceError`], never a fabricated version.
+pub const RELEASES_URL_ENV: &str = "PWSH_AUTOUPDATE_RELEASES_URL";
+
+/// Env var that overrides the stable build-info source URL (same test-only
+/// seam contract as [`RELEASES_URL_ENV`]).
+pub const BUILD_INFO_URL_ENV: &str = "PWSH_AUTOUPDATE_BUILDINFO_URL";
+
+/// The effective GitHub Releases "latest" URL: the [`RELEASES_URL_ENV`] override
+/// if set and non-empty, otherwise the real pinned [`GITHUB_RELEASES_LATEST_URL`].
+/// Production never sets the env var, so this returns the real URL unchanged.
+pub fn releases_url() -> String {
+    env_override(RELEASES_URL_ENV).unwrap_or_else(|| GITHUB_RELEASES_LATEST_URL.to_string())
+}
+
+/// The effective stable build-info URL: the [`BUILD_INFO_URL_ENV`] override if
+/// set and non-empty, otherwise the real pinned [`BUILD_INFO_STABLE_URL`].
+pub fn build_info_url() -> String {
+    env_override(BUILD_INFO_URL_ENV).unwrap_or_else(|| BUILD_INFO_STABLE_URL.to_string())
+}
+
+/// Read an override env var, treating unset/empty as "no override" so the real
+/// default is always used in production.
+fn env_override(key: &str) -> Option<String> {
+    match std::env::var(key) {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => None,
+    }
+}
 
 /// GET from an upstream source. The orchestration uses this to resolve the
 /// latest stable PowerShell release; tests inject a fake. Both methods map any
