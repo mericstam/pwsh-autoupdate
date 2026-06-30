@@ -61,10 +61,13 @@ pub fn resolve_install(os: Os, available: &[InstallMethod]) -> Option<InstallPla
         }
         Os::Macos => {
             if has(InstallMethod::Homebrew) {
+                // The Homebrew *formula* (`brew install powershell`) is the
+                // current method; the old `--cask powershell` is deprecated and
+                // unavailable (Microsoft docs even tell you to uninstall it).
                 Some(plan(
                     InstallMethod::Homebrew,
                     "brew",
-                    &["install", "--cask", "powershell"],
+                    &["install", "powershell"],
                     false,
                 ))
             } else {
@@ -224,10 +227,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_install_macos_uses_homebrew_cask() {
+    fn resolve_install_macos_uses_homebrew_formula() {
         let p = resolve_install(Os::Macos, &[InstallMethod::Homebrew]).unwrap();
         assert_eq!(p.program, "brew");
-        assert_eq!(p.args, vec!["install", "--cask", "powershell"]);
+        // The formula, not the deprecated `--cask powershell`.
+        assert_eq!(p.args, vec!["install", "powershell"]);
         assert!(!p.requires_elevation);
     }
 
