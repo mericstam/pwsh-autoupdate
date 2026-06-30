@@ -33,7 +33,8 @@ When PowerShell is **absent**, the tool installs it (it no longer errors out):
    (the risk ADR-0001 guarded against is preserved).
 2. **Channel: native, fall back to portable.** Prefer the OS's standard package
    manager when present — Windows `winget` (then `choco`), macOS Homebrew
-   (`brew install --cask powershell`), Linux `snap` (`--classic`). `apt`/`dnf`
+   (`brew install powershell` — the formula; the old `--cask` is deprecated),
+   Linux `snap` (`--classic`). `apt`/`dnf`
    are excluded as auto-install channels (a from-zero install needs Microsoft's
    repo configured first — multi-step, root). When no native channel is
    available, fall back to a **portable install** under `~/.local`.
