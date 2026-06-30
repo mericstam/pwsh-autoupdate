@@ -69,3 +69,39 @@ jobs:
             *.tar.gz
             *.zip
             *.sha256
+
+  # Generate the Homebrew formula + Scoop manifest from the just-published
+  # release (correct per-asset SHA256s), attach them to the release, and — when
+  # a HOMEBREW_TAP_TOKEN secret is configured — push the formula to the tap repo
+  # so `brew` stays current automatically. Without the secret it skips that step
+  # gracefully (the manifest is still attached to the release).
+  manifests:
+    name: package-manager manifests
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Generate manifests
+        run: |
+          mkdir -p dist
+          bash scripts/gen-manifests.sh "${GITHUB_REF_NAME#v}" dist
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/pwsh-autoupdate.rb
+            dist/pwsh-autoupdate.json
+      - name: Update Homebrew tap
+        if: ${{ env.TAP_TOKEN != '' }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/mericstam/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp dist/pwsh-autoupdate.rb tap/Formula/pwsh-autoupdate.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/pwsh-autoupdate.rb
+          git commit -m "pwsh-autoupdate ${ver}" || { echo "tap already current"; exit 0; }
+          git push

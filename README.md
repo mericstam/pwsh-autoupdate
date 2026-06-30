@@ -12,6 +12,43 @@ duplicate or broken installs. `pwsh-autoupdate` works out which channel owns you
 compares versions with semantic-versioning rules, and — when you ask it to —
 upgrades through the owning channel.
 
+## Install
+
+### Homebrew (macOS, Linux)
+
+```sh
+brew install mericstam/tap/pwsh-autoupdate
+```
+
+### Scoop (Windows)
+
+```powershell
+scoop install https://raw.githubusercontent.com/mericstam/pwsh-autoupdate/main/pkg/scoop/pwsh-autoupdate.json
+```
+
+### From source (any platform with a Rust toolchain)
+
+```sh
+cargo install --git https://github.com/mericstam/pwsh-autoupdate
+```
+
+### Direct download
+
+Download the archive for your platform from the
+[latest release](https://github.com/mericstam/pwsh-autoupdate/releases/latest),
+verify its `.sha256`, and put the binary on your `PATH`. Each release also
+attaches a ready-to-use Homebrew formula (`pwsh-autoupdate.rb`) and Scoop
+manifest (`pwsh-autoupdate.json`).
+
+The binaries are not yet code-signed, so a **browser** download may be flagged by
+the OS. A package manager above avoids this; for a direct download:
+
+- **macOS:** clear the quarantine flag with `xattr -d com.apple.quarantine ./pwsh-autoupdate`
+  (or right-click → Open once). Fetching the tarball with `curl`/`tar` instead of a
+  browser usually avoids the flag entirely.
+- **Windows:** Right-click the `.exe` → Properties → **Unblock**; or just run it from a
+  terminal — SmartScreen's prompt targets double-clicked GUI apps, not command-line use.
+
 ## What it does
 
 1. Probes the local `pwsh` to read its installed version.

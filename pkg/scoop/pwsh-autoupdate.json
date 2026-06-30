@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "description": "Detect how PowerShell was installed and update (or install) it via the owning manager",
+  "homepage": "https://github.com/mericstam/pwsh-autoupdate",
+  "license": "MIT OR Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/mericstam/pwsh-autoupdate/releases/download/v0.2.0/pwsh-autoupdate-v0.2.0-x86_64-pc-windows-msvc.zip",
+      "hash": "d25e95721b61e2ca9f488bd72fc1457ca336cf5f0e653a99aa06b39dba3d0d8c",
+      "extract_dir": "pwsh-autoupdate-v0.2.0-x86_64-pc-windows-msvc"
+    }
+  },
+  "bin": "pwsh-autoupdate.exe",
+  "checkver": "github",
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/mericstam/pwsh-autoupdate/releases/download/v$version/pwsh-autoupdate-v$version-x86_64-pc-windows-msvc.zip",
+        "extract_dir": "pwsh-autoupdate-v$version-x86_64-pc-windows-msvc"
+      }
+    },
+    "hash": {
+      "url": "$url.sha256"
+    }
+  }
+}
