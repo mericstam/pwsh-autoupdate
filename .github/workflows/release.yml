@@ -72,15 +72,18 @@ jobs:
 
   # Generate the Homebrew formula + Scoop manifest from the just-published
   # release (correct per-asset SHA256s), attach them to the release, and — when
-  # a HOMEBREW_TAP_TOKEN secret is configured — push the formula to the tap repo
-  # so `brew` stays current automatically. Without the secret it skips that step
-  # gracefully (the manifest is still attached to the release).
+  # the HOMEBREW_TAP_DEPLOY_KEY secret is configured — push the formula to the
+  # tap repo over SSH so `brew` stays current automatically. The secret is a
+  # deploy key scoped to ONLY the homebrew-tap repo (no account-wide access);
+  # this job only runs on tag pushes, which forks cannot trigger, so the key is
+  # never exposed to fork PRs. Without the secret it skips that step gracefully
+  # (the manifest is still attached to the release).
   manifests:
     name: package-manager manifests
     needs: build
     runs-on: ubuntu-latest
     env:
-      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Generate manifests
@@ -93,10 +96,15 @@ jobs:
             dist/pwsh-autoupdate.rb
             dist/pwsh-autoupdate.json
       - name: Update Homebrew tap
-        if: ${{ env.TAP_TOKEN != '' }}
+        if: ${{ env.TAP_DEPLOY_KEY != '' }}
         run: |
           ver="${GITHUB_REF_NAME#v}"
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/mericstam/homebrew-tap.git" tap
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$TAP_DEPLOY_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
+          git clone git@github.com:mericstam/homebrew-tap.git tap
           mkdir -p tap/Formula
           cp dist/pwsh-autoupdate.rb tap/Formula/pwsh-autoupdate.rb
           cd tap
@@ -105,3 +113,4 @@ jobs:
           git add Formula/pwsh-autoupdate.rb
           git commit -m "pwsh-autoupdate ${ver}" || { echo "tap already current"; exit 0; }
           git push
+          rm -f ~/.ssh/tap_key
