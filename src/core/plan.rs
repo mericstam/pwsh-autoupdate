@@ -11,7 +11,7 @@
 //! not here — core only fixes the program/args shape.
 
 use crate::core::error::PlanError;
-use crate::core::{InstallMethod, InstallPlan, Os, UpdatePlan};
+use crate::core::{InstallMethod, InstallPlan, Os, PlanCommand, UpdatePlan};
 use semver::Version;
 
 /// Resolve the NATIVE from-scratch install command for `os`, given which manager
@@ -181,6 +181,23 @@ pub fn build_plan(
         }
     };
 
+    // Follow-up steps that run only after the primary command succeeds.
+    // Homebrew's `powershell` formula frequently fails to relink `pwsh` after
+    // `brew upgrade` (a file already exists in the prefix -> brew leaves the keg
+    // unlinked and prints "run brew link --overwrite"). We fold that remediation
+    // into the plan so every upgrade is self-healing; the step is idempotent
+    // (a clean relink when nothing was wrong).
+    let post_steps: Vec<PlanCommand> = match (os, method) {
+        (Os::Macos, InstallMethod::Homebrew) => vec![PlanCommand {
+            program: "brew".to_string(),
+            args: ["link", "--overwrite", "powershell"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }],
+        _ => Vec::new(),
+    };
+
     Ok(UpdatePlan {
         method,
         from,
@@ -188,6 +205,7 @@ pub fn build_plan(
         program: program.to_string(),
         args: args.iter().map(|s| s.to_string()).collect(),
         requires_elevation,
+        post_steps,
     })
 }
 
@@ -302,6 +320,36 @@ mod tests {
         assert_eq!(p.program, "brew");
         assert_eq!(p.args, vec!["upgrade", "powershell"]);
         assert!(!p.requires_elevation);
+    }
+
+    #[test]
+    fn brew_plan_relinks_powershell_after_upgrade() {
+        // `brew upgrade powershell` regularly leaves `pwsh` unlinked; the plan
+        // carries a follow-up `brew link --overwrite powershell` so the upgrade
+        // is self-healing (users no longer relink by hand).
+        let p = plan(InstallMethod::Homebrew, Os::Macos);
+        assert_eq!(p.post_steps.len(), 1);
+        assert_eq!(p.post_steps[0].program, "brew");
+        assert_eq!(
+            p.post_steps[0].args,
+            vec!["link", "--overwrite", "powershell"]
+        );
+    }
+
+    #[test]
+    fn non_homebrew_plans_have_no_post_steps() {
+        // The relink is Homebrew-specific; no other channel should carry one.
+        assert!(plan(InstallMethod::Winget, Os::Windows)
+            .post_steps
+            .is_empty());
+        assert!(plan(InstallMethod::Chocolatey, Os::Windows)
+            .post_steps
+            .is_empty());
+        assert!(plan(InstallMethod::MacPkg, Os::Macos).post_steps.is_empty());
+        assert!(plan(InstallMethod::AptDpkg, Os::Linux)
+            .post_steps
+            .is_empty());
+        assert!(plan(InstallMethod::Snap, Os::Linux).post_steps.is_empty());
     }
 
     #[test]

@@ -334,6 +334,7 @@ pub fn run_update_with(
     let arg_refs: Vec<&str> = plan.args.iter().map(String::as_str).collect();
     match runner.run(&plan.program, &arg_refs) {
         Ok(output) if output.status == 0 => {
+            run_post_steps(runner, &plan, out, err);
             let _ = writeln!(
                 out,
                 "PowerShell updated successfully to {}.",
@@ -359,6 +360,7 @@ pub fn run_update_with(
                 .unwrap_or(false);
 
             if verified {
+                run_post_steps(runner, &plan, out, err);
                 let _ = writeln!(
                     out,
                     "PowerShell updated successfully to {} ('{}' exited with status {}, but the installed version now matches the target).",
@@ -385,6 +387,45 @@ pub fn run_update_with(
                 plan.program
             );
             EXIT_FAILURE
+        }
+    }
+}
+
+/// Run a plan's follow-up steps after the primary upgrade succeeded.
+///
+/// These are best-effort self-healing steps (Homebrew's
+/// `brew link --overwrite powershell`, which repairs the `pwsh` symlink that
+/// `brew upgrade` leaves unlinked on a file conflict). The new version is
+/// already installed by the time we get here, so a failing step is surfaced as
+/// a WARNING with the manual remediation command — never as a failed update.
+fn run_post_steps(
+    runner: &dyn CommandRunner,
+    plan: &crate::core::UpdatePlan,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) {
+    for step in &plan.post_steps {
+        let display = render_command(&step.program, &step.args);
+        let _ = writeln!(out, "Running: {display}");
+        let arg_refs: Vec<&str> = step.args.iter().map(String::as_str).collect();
+        match runner.run(&step.program, &arg_refs) {
+            Ok(o) if o.status == 0 => {}
+            Ok(o) => {
+                let _ = writeln!(
+                    err,
+                    "warning: follow-up step '{display}' exited with status {}; PowerShell was updated but you may need to run `{display}` manually if `pwsh` still points at the old version.",
+                    o.status
+                );
+                if !o.stderr.trim().is_empty() {
+                    let _ = writeln!(err, "{}", o.stderr.trim_end());
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    err,
+                    "warning: failed to run follow-up step '{display}': {e}; PowerShell was updated but you may need to run `{display}` manually if `pwsh` still points at the old version."
+                );
+            }
         }
     }
 }
@@ -553,6 +594,10 @@ mod tests {
         /// invocation has run — modelling a manager that applied the upgrade
         /// (so a re-probe sees the new version) even if it exited non-zero.
         post_upgrade_version: Option<String>,
+        /// When set, a `link`-style follow-up step fails with this status/stderr
+        /// while the primary upgrade still succeeds — modelling Homebrew's
+        /// relink failing after a successful upgrade.
+        fail_post_step: Option<(i32, String)>,
     }
     fn is_mutating_args(args: &[&str]) -> bool {
         args.iter()
@@ -561,6 +606,10 @@ mod tests {
     impl FakeRunner {
         fn fail_upgrade(mut self, status: i32, stderr: &str) -> Self {
             self.fail_upgrade = Some((status, stderr.to_string()));
+            self
+        }
+        fn fail_post_step(mut self, status: i32, stderr: &str) -> Self {
+            self.fail_post_step = Some((status, stderr.to_string()));
             self
         }
         /// After any mutating call, `pwsh --version` reports `version_line`.
@@ -625,6 +674,15 @@ mod tests {
             }
             if let Some((status, stderr)) = &self.fail_upgrade {
                 if is_mutating_args(args) {
+                    return Ok(crate::adapters::runner::CmdOutput {
+                        status: *status,
+                        stdout: String::new(),
+                        stderr: stderr.clone(),
+                    });
+                }
+            }
+            if let Some((status, stderr)) = &self.fail_post_step {
+                if args.contains(&"link") {
                     return Ok(crate::adapters::runner::CmdOutput {
                         status: *status,
                         stdout: String::new(),
@@ -807,15 +865,46 @@ mod tests {
         let stdout = String::from_utf8(out).unwrap();
         assert_eq!(code, EXIT_SUCCESS);
         assert!(stdout.contains("updated successfully"));
-        // The exact detected command ran (FR-9 agreement: brew upgrade powershell).
+        // The exact detected command ran (FR-9 agreement: brew upgrade powershell),
+        // followed by the self-healing relink (brew link --overwrite powershell).
         let muts = mutating_runs(&runner);
         assert_eq!(
             muts,
-            vec![(
-                "brew".to_string(),
-                vec!["upgrade".to_string(), "powershell".to_string()]
-            )]
+            vec![
+                (
+                    "brew".to_string(),
+                    vec!["upgrade".to_string(), "powershell".to_string()]
+                ),
+                (
+                    "brew".to_string(),
+                    vec![
+                        "link".to_string(),
+                        "--overwrite".to_string(),
+                        "powershell".to_string()
+                    ]
+                )
+            ]
         );
+    }
+
+    #[test]
+    fn update_brew_failed_relink_warns_but_still_reports_success() {
+        // The upgrade succeeded; only the follow-up `brew link --overwrite`
+        // failed. That is a WARNING (pwsh is installed) — never a failed update.
+        let http = FakeHttp::ok("7.5.0");
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("brew", "powershell")
+            .fail_post_step(1, "Error: Could not symlink bin/pwsh");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Macos, false, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(stdout.contains("updated successfully"));
+        assert!(stderr.contains("warning:"));
+        assert!(stderr.contains("brew link --overwrite powershell"));
+        assert!(!stderr.contains("error:"));
     }
 
     #[test]
