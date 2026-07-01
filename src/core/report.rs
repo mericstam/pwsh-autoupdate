@@ -81,11 +81,21 @@ impl fmt::Display for CheckReport {
 
         match (&self.plan, self.detection.selected) {
             (Some(plan), _) => {
-                let cmd = if plan.args.is_empty() {
-                    plan.program.clone()
-                } else {
-                    format!("{} {}", plan.program, plan.args.join(" "))
+                let render = |program: &str, args: &[String]| {
+                    if args.is_empty() {
+                        program.to_string()
+                    } else {
+                        format!("{} {}", program, args.join(" "))
+                    }
                 };
+                // Primary command plus any follow-up steps, joined with `&&` to
+                // convey "the next runs only if the previous succeeded" — the
+                // exact execution semantics (FR-9 agreement).
+                let mut cmd = render(&plan.program, &plan.args);
+                for step in &plan.post_steps {
+                    cmd.push_str(" && ");
+                    cmd.push_str(&render(&step.program, &step.args));
+                }
                 write!(f, "Would run:       {cmd}")?;
             }
             (None, None) => {
@@ -136,6 +146,31 @@ mod tests {
         assert!(out.contains("Status:          update available"));
         assert!(out.contains(
             "Would run:       winget upgrade --id Microsoft.PowerShell --silent --accept-source-agreements --accept-package-agreements"
+        ));
+    }
+
+    #[test]
+    fn homebrew_report_shows_relink_follow_up_step() {
+        let plan = crate::core::plan::build_plan(
+            InstallMethod::Homebrew,
+            v("7.4.0"),
+            v("7.5.0"),
+            Os::Macos,
+        )
+        .unwrap();
+        let report = CheckReport::build(
+            v("7.4.0"),
+            v("7.5.0"),
+            VersionState::UpdateAvailable,
+            Detection {
+                selected: Some(InstallMethod::Homebrew),
+                also_detected: vec![],
+            },
+            Some(plan),
+        );
+        let out = report.to_string();
+        assert!(out.contains(
+            "Would run:       brew upgrade powershell && brew link --overwrite powershell"
         ));
     }
 

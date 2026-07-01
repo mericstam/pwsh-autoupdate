@@ -121,6 +121,14 @@ pub struct InstallPlan {
     pub requires_elevation: bool,
 }
 
+/// A single `program args...` invocation. Used for a plan's optional follow-up
+/// steps that must run *after* the primary upgrade command succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
 /// The plan — built once, drives BOTH the `--check` report and the real update
 /// (FR-9 agreement: reported command equals executed command).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,4 +141,12 @@ pub struct UpdatePlan {
     /// FR-12: the host surfaces this before/at execution; the tool never
     /// self-elevates.
     pub requires_elevation: bool,
+    /// Follow-up commands run (in order) only after the primary command
+    /// succeeds. Empty for most channels. Homebrew populates this with
+    /// `brew link --overwrite powershell` because `brew upgrade powershell`
+    /// routinely leaves the `pwsh` symlink unlinked on a file conflict, which
+    /// otherwise forces users to relink by hand after every upgrade. These are
+    /// best-effort self-healing steps: a failure is surfaced as a warning, not
+    /// a failed update (the new version is already installed at that point).
+    pub post_steps: Vec<PlanCommand>,
 }
