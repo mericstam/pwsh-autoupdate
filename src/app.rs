@@ -13,10 +13,11 @@
 
 use crate::adapters::http::HttpClient;
 use crate::adapters::runner::CommandRunner;
-use crate::adapters::{probe, resolve_latest_stable};
+use crate::adapters::{portable, probe, resolve_latest_stable};
 use crate::core::error::CoreError;
 use crate::core::{
-    detect, plan, report::CheckReport, version, Detection, InstallMethod, Os, VersionState,
+    detect, plan, report::CheckReport, version, Detection, InstallMethod, Os, ReleaseInfo,
+    VersionState,
 };
 use std::io::Write;
 
@@ -299,6 +300,28 @@ pub fn run_update_with(
         }
     };
 
+    // Portable tar.gz runs the download-and-replace IN-PROCESS. The plan still
+    // reads `pwsh-autoupdate --replace-portable` (FR-9: running that command
+    // manually does exactly this), but we never spawn ourselves via a PATH
+    // lookup — a shadowing binary earlier in PATH must not be executed instead.
+    // Privilege needs are checked against the actual install dir at runtime
+    // (a user-owned ~/powershell needs none; /opt/... surfaces the FR-12 error).
+    if plan.method == InstallMethod::PortableTarGz {
+        let _ = writeln!(
+            out,
+            "Updating PowerShell {} -> {} via {} ...",
+            current,
+            latest.version,
+            method.label()
+        );
+        let _ = writeln!(
+            out,
+            "Running: {}",
+            render_command(&plan.program, &plan.args)
+        );
+        return portable_update(http, runner, &latest, out, err);
+    }
+
     // FR-12: surface a privilege requirement; never self-elevate.
     if plan.requires_elevation && !elevated {
         let _ = writeln!(
@@ -386,6 +409,121 @@ pub fn run_update_with(
                 "error: failed to run '{}': {e}. PowerShell was not updated.",
                 plan.program
             );
+            EXIT_FAILURE
+        }
+    }
+}
+
+/// The `--replace-portable` entry point (A-6): the command the update path
+/// reports for a portable tar.gz install, runnable directly. Probes and
+/// validates that the installed pwsh really is a portable install (never
+/// replaces anything else), resolves the latest stable, and performs the
+/// download-and-replace. Exit codes: 0 success (incl. up-to-date no-op),
+/// non-zero failure.
+pub fn run_replace_portable(
+    http: &dyn HttpClient,
+    runner: &dyn CommandRunner,
+    os: Os,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    // The portable tar.gz channel is defined for Linux only (core::plan).
+    if os != Os::Linux {
+        let _ = writeln!(
+            err,
+            "error: --replace-portable supports Linux portable tar.gz installs only."
+        );
+        return EXIT_FAILURE;
+    }
+
+    let signals = probe::probe(runner, os);
+    if !signals.pwsh_present {
+        let _ = writeln!(
+            err,
+            "error: PowerShell is not installed; there is no portable install to replace."
+        );
+        return EXIT_FAILURE;
+    }
+    let current = match signals.current_version.as_deref() {
+        Some(raw) => match version::parse(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return EXIT_FAILURE;
+            }
+        },
+        None => {
+            let _ = writeln!(
+                err,
+                "error: could not determine the installed PowerShell version"
+            );
+            return EXIT_FAILURE;
+        }
+    };
+
+    // Only a portable-detected install may be replaced (FR-6: never use a
+    // different channel than the owning one).
+    let detection = detect::resolve(os, &signals);
+    if detection.selected != Some(InstallMethod::PortableTarGz) {
+        let _ = writeln!(
+            err,
+            "error: the installed PowerShell is not a portable tar.gz install (detected: {}); use `pwsh-autoupdate` to update via the owning channel.",
+            detection
+                .selected
+                .map(InstallMethod::label)
+                .unwrap_or("undetermined")
+        );
+        return EXIT_FAILURE;
+    }
+
+    let latest = match resolve_latest_stable(http) {
+        Ok(info) => info,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return EXIT_FAILURE;
+        }
+    };
+
+    if version::classify(&current, &latest.version) == VersionState::UpToDate {
+        let _ = writeln!(
+            out,
+            "PowerShell {current} is up to date (latest stable: {}). Nothing to do.",
+            latest.version
+        );
+        return EXIT_SUCCESS;
+    }
+
+    let _ = writeln!(
+        out,
+        "Updating PowerShell {} -> {} via portable tar.gz ...",
+        current, latest.version
+    );
+    portable_update(http, runner, &latest, out, err)
+}
+
+/// Perform the portable download-and-replace to `latest` and map the outcome
+/// to an exit code. The adapter verifies the swapped-in binary reports the
+/// target version before discarding the previous install (and rolls back
+/// otherwise), so an `Ok` here IS the verified outcome — success is never
+/// reported on a real failure (FR-6).
+fn portable_update(
+    http: &dyn HttpClient,
+    runner: &dyn CommandRunner,
+    latest: &ReleaseInfo,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    match portable::replace_portable(http, runner, &latest.version, out) {
+        Ok(()) => {
+            let _ = writeln!(
+                out,
+                "PowerShell updated successfully to {}.",
+                latest.version
+            );
+            EXIT_SUCCESS
+        }
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}. PowerShell was not updated.");
             EXIT_FAILURE
         }
     }
@@ -540,6 +678,7 @@ mod tests {
     #[derive(Default)]
     struct FakeHttp {
         bodies: HashMap<String, String>,
+        raw: HashMap<String, Vec<u8>>,
         fail_url: Option<String>,
     }
     impl FakeHttp {
@@ -555,14 +694,21 @@ mod tests {
             );
             Self {
                 bodies,
+                raw: HashMap::new(),
                 fail_url: None,
             }
         }
         fn failing() -> Self {
             Self {
                 bodies: HashMap::new(),
+                raw: HashMap::new(),
                 fail_url: Some(BUILD_INFO_STABLE_URL.to_string()),
             }
+        }
+        /// Register a binary body (release-asset download fixture).
+        fn raw(mut self, url: &str, body: Vec<u8>) -> Self {
+            self.raw.insert(url.to_string(), body);
+            self
         }
     }
     impl HttpClient for FakeHttp {
@@ -578,6 +724,12 @@ mod tests {
                 .get(url)
                 .cloned()
                 .ok_or_else(|| SourceError::Fetch(format!("no fake for {url}")))
+        }
+        fn get_bytes(&self, url: &str, _max_bytes: u64) -> Result<Vec<u8>, SourceError> {
+            if let Some(body) = self.raw.get(url) {
+                return Ok(body.clone());
+            }
+            self.get_text(url).map(String::into_bytes)
         }
     }
 
@@ -598,6 +750,9 @@ mod tests {
         /// while the primary upgrade still succeeds — modelling Homebrew's
         /// relink failing after a successful upgrade.
         fail_post_step: Option<(i32, String)>,
+        /// When set, `resolve_program_path` reports this as the canonical pwsh
+        /// binary path — modelling a portable install at that location.
+        resolved_pwsh: Option<String>,
     }
     fn is_mutating_args(args: &[&str]) -> bool {
         args.iter()
@@ -615,6 +770,12 @@ mod tests {
         /// After any mutating call, `pwsh --version` reports `version_line`.
         fn upgrades_to(mut self, version_line: &str) -> Self {
             self.post_upgrade_version = Some(version_line.to_string());
+            self
+        }
+        /// Model the canonical on-disk location of the pwsh binary (portable
+        /// installs resolve to a real path inside the install tree).
+        fn resolved_at(mut self, path: &str) -> Self {
+            self.resolved_pwsh = Some(path.to_string());
             self
         }
         fn pwsh(version_line: &str) -> Self {
@@ -696,6 +857,9 @@ mod tests {
         }
         fn exists(&self, program: &str) -> bool {
             self.present.contains(program)
+        }
+        fn resolve_program_path(&self, _program: &str) -> Option<String> {
+            self.resolved_pwsh.clone()
         }
     }
 
@@ -1099,6 +1263,125 @@ mod tests {
         assert!(!stdout.contains("installed successfully"));
         assert!(stderr.contains("install via snap failed"));
         assert!(stderr.contains("snap: install failed"));
+    }
+
+    // --- portable tar.gz path -------------------------------------------------
+
+    /// A portable install tree `<td>/powershell/7.6.2/pwsh`; returns the guard,
+    /// install dir, and binary path.
+    fn portable_tree(old: &str) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let td = tempfile::tempdir().unwrap();
+        let install = td.path().join("powershell").join("7.6.2");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join("pwsh"), old).unwrap();
+        let binary = install.join("pwsh").to_string_lossy().into_owned();
+        (td, install, binary)
+    }
+
+    #[test]
+    fn update_portable_runs_in_process_never_spawning_self() {
+        // Portable install detected, update available, but the fake HTTP has no
+        // release-asset bytes -> the in-process portable path is attempted and
+        // fails honestly at download. Crucially, NO `pwsh-autoupdate` process
+        // is spawned (the plan's display command is not PATH-executed).
+        let http = FakeHttp::ok("7.6.3");
+        let (_td, _install, binary) = portable_tree("old");
+        let runner = FakeRunner::pwsh("PowerShell 7.6.2").resolved_at(&binary);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Linux, false, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        // FR-9: the reported command is the documented flag form.
+        assert!(stdout.contains("Running: pwsh-autoupdate --replace-portable"));
+        assert!(stderr.contains("failed to download"));
+        assert!(!stdout.contains("updated successfully"));
+        // No subprocess named pwsh-autoupdate was ever run.
+        assert!(runner
+            .runs
+            .borrow()
+            .iter()
+            .all(|(p, _)| p != "pwsh-autoupdate"));
+    }
+
+    #[test]
+    fn replace_portable_happy_path_updates_and_exits_0() {
+        use crate::adapters::portable::fixtures;
+        use crate::core::portable as rules;
+
+        let (_td, install, binary) = portable_tree("old-binary");
+        let tarball = fixtures::payload_targz();
+        // Derive the asset the same way the adapter does (from the REAL host
+        // arch), so the test runs unchanged on x86_64 and aarch64 runners.
+        let asset = rules::asset_name(
+            &semver::Version::parse("7.6.3").unwrap(),
+            rules::arch_label(std::env::consts::ARCH).expect("test host arch"),
+        );
+        let http = FakeHttp::ok("7.6.3")
+            .raw(
+                &rules::hashes_url("v7.6.3"),
+                fixtures::manifest_utf16le(&[(&fixtures::sha256_hex(&tarball), &asset)]),
+            )
+            .raw(&rules::asset_url("v7.6.3", &asset), tarball);
+        // Probe sees 7.6.2 via `pwsh`; the post-swap verify runs the binary by
+        // its absolute path, which reports the new version.
+        let runner = FakeRunner::pwsh("PowerShell 7.6.2")
+            .with_manager(&binary, "PowerShell 7.6.3")
+            .resolved_at(&binary);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_replace_portable(&http, &runner, Os::Linux, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_SUCCESS, "stderr: {stderr}");
+        assert!(stdout.contains("updated successfully to 7.6.3"));
+        // The install dir now holds the new payload at the same path.
+        assert!(std::fs::read_to_string(install.join("pwsh"))
+            .unwrap()
+            .contains("echo new"));
+    }
+
+    #[test]
+    fn replace_portable_up_to_date_is_noop_exit_0() {
+        let http = FakeHttp::ok("7.6.2"); // latest == installed
+        let (_td, _install, binary) = portable_tree("old");
+        let runner = FakeRunner::pwsh("PowerShell 7.6.2").resolved_at(&binary);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_replace_portable(&http, &runner, Os::Linux, &mut out, &mut err);
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(String::from_utf8(out).unwrap().contains("Nothing to do"));
+    }
+
+    #[test]
+    fn replace_portable_refuses_a_manager_owned_install() {
+        // dpkg owns pwsh -> --replace-portable must refuse (FR-6: never a
+        // different channel than the owning one) and point at the update path.
+        let http = FakeHttp::ok("7.6.3");
+        let runner = FakeRunner::pwsh("PowerShell 7.6.2")
+            .with_manager("dpkg", "Package: powershell\nStatus: install ok installed");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_replace_portable(&http, &runner, Os::Linux, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(stderr.contains("not a portable tar.gz install"));
+        assert!(stderr.contains("apt/dpkg"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn replace_portable_is_linux_only() {
+        let http = FakeHttp::ok("7.6.3");
+        let runner = FakeRunner::pwsh("PowerShell 7.6.2");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_replace_portable(&http, &runner, Os::Windows, &mut out, &mut err);
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("Linux portable tar.gz installs only"));
     }
 
     #[test]

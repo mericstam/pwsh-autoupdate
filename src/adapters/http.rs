@@ -68,6 +68,13 @@ pub trait HttpClient {
     /// GET the URL and return the raw response body as text (build-info feed).
     /// Same failure mapping as [`HttpClient::get_json`] for the fetch path.
     fn get_text(&self, url: &str) -> Result<String, SourceError>;
+
+    /// GET the URL and return the raw response body bytes, refusing bodies
+    /// larger than `max_bytes` (release-asset downloads: the tar.gz payload and
+    /// the `hashes.sha256` manifest, which is UTF-16 — not valid `get_text`
+    /// input). Failures map to [`SourceError::Fetch`]; an over-limit body is a
+    /// fetch failure, never a truncated "success".
+    fn get_bytes(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, SourceError>;
 }
 
 /// GitHub Releases payload (only the fields we consume). Tolerant of extra and
@@ -155,6 +162,21 @@ impl HttpClient for RealHttp {
             .read_to_string()
             .map_err(|e| SourceError::Fetch(e.to_string()))?;
         Ok(body)
+    }
+
+    fn get_bytes(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, SourceError> {
+        // `read_to_vec` defaults to a 10 MB cap; the caller-provided limit
+        // raises it for the tarball while still bounding a runaway body.
+        self.agent
+            .get(url)
+            .header("User-Agent", &self.user_agent)
+            .call()
+            .map_err(|e| SourceError::Fetch(e.to_string()))?
+            .body_mut()
+            .with_config()
+            .limit(max_bytes)
+            .read_to_vec()
+            .map_err(|e| SourceError::Fetch(e.to_string()))
     }
 }
 

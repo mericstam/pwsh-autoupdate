@@ -9,6 +9,7 @@
 pub mod detect;
 pub mod error;
 pub mod plan;
+pub mod portable;
 pub mod report;
 pub mod version;
 

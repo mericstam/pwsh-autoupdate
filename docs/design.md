@@ -214,6 +214,16 @@ Notes for the coder:
 - For `.pkg` and portable tar.gz, the "command" is a small fixed procedure, not a single manager
   invocation; model it as a `program`+`args` where the program is the OS tool that performs the step
   (`installer`, or a replace step), and keep the *asset URL* resolution in the adapter, not core.
+- The portable tar.gz procedure is implemented as `pwsh-autoupdate --replace-portable` (the plan's
+  reported command, and a real runnable flag) executed **in-process** by the update path — never a
+  PATH self-spawn. It constructs the asset URL from the resolved version (pure rules in
+  `core::portable`; never from an API response), verifies SHA-256 against the release
+  `hashes.sha256` manifest (UTF-16LE upstream), extracts with hardened rules (no path escapes /
+  disallowed entry types / setuid bits, size-capped), atomically swaps the contents of the
+  directory the resolved binary lives in (so PATH entries and symlinks stay valid), and verifies
+  the swapped-in binary reports the target version before discarding the backup — otherwise it
+  rolls back. Elevation is checked at runtime against the actual dir ownership (the row's
+  "depends on dir ownership"): the FR-12 message is surfaced on a permission failure.
 - `requires_elevation` is a static property of the (method, os) pair (e.g. anything writing system
   paths or running root package managers). The host checks it and surfaces the requirement (FR-12);
   the tool never self-elevates.

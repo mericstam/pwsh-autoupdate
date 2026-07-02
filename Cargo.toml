@@ -17,6 +17,9 @@ semver      = "1.0"
 anyhow      = "1.0"
 thiserror   = "2.0"
 ureq        = "3.3"
+sha2        = "0.10"
+flate2      = "1.1"
+tar         = "0.4"
 
 [dev-dependencies]
 mockito     = "1.7"

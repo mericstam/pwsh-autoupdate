@@ -119,6 +119,31 @@ pwsh-autoupdate --verbose
 pwsh-autoupdate --check --verbose
 ```
 
+Update a **portable tar.gz** install directly (Linux; this is the command the
+default update path runs — and reports under `--check` — when it detects a
+portable install):
+
+```sh
+pwsh-autoupdate --replace-portable
+```
+
+The portable update downloads the release tarball for your CPU from the pinned
+`github.com/PowerShell/PowerShell` release tree (the URL is constructed from
+the resolved version, never taken from an API response), verifies its SHA-256
+against the release's `hashes.sha256` manifest, extracts it with hardened rules
+(no path escapes, no setuid bits, size-capped), and atomically swaps it into
+the existing install directory with rollback — the previous install is restored
+if anything fails, including if the new binary does not report the expected
+version. Replacing in place keeps every `PATH` entry and symlink (e.g.
+`~/.local/bin/pwsh`) valid; note the versioned directory name itself is kept
+(e.g. `.../powershell/7.6.2` may contain a newer version after an update — the
+reported version always comes from `pwsh --version`, not the path). It refuses
+to touch a `pwsh` owned by a package manager, and if the install directory is
+not writable it reports the elevation requirement and stops (it never
+self-elevates). The SHA-256 manifest ships from the same GitHub release as the
+tarball, so the check guards integrity in transit — the trust root is TLS to
+`github.com`, the same as any package manager installing from GitHub releases.
+
 There are no other flags. `--check` is read-only: it executes no
 package-manager process and performs no state-changing or network-write side
 effect. It prints the current installed version, the detected install method
