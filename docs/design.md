@@ -48,8 +48,8 @@ Matches the `tasks.yaml` task→path coverage exactly.
 | `src/core/error.rs` | core | `thiserror` typed errors: `SourceError`, `DetectError`, `PlanError`, and a top `CoreError`. Carries the "never fabricate a version" semantics (a source failure is representable with no latest-version value). | error-core |
 | `src/core/version.rs` | core | semver parse + the pure `classify(current, latest) -> VersionState` decision incl. ADR-0003 prerelease rule. | version-core |
 | `src/core/detect.rs` | core | pure detection rules over `DetectionSignals` + ADR-0004 precedence → `Detection { selected, also_detected }`. | detect-rules-core |
-| `src/core/plan.rs` | core | pure `build_plan(method, from, to, os) -> UpdatePlan` incl. the per-OS+method command table and the `requires_elevation` flag (FR-12). | plan-core |
-| `src/core/report.rs` | core | `--check` report model + `Display`: current, method (+ also-detected), latest, would-run command; undetermined-method case. | report-core |
+| `src/core/plan.rs` | core | pure `build_plan(method, from, to, os) -> UpdatePlan` and `build_uninstall_plan(method, os) -> UninstallPlan` (ADR-0007) incl. the per-OS+method command tables and the `requires_elevation` flag (FR-12). | plan-core |
+| `src/core/report.rs` | core | `--check` report model (`CheckReport`) and `--uninstall` report model (`UninstallReport`) + `Display`: current, method (+ also-detected), latest, would-run command; undetermined-method case. | report-core |
 | `src/adapters/mod.rs` | adapter | re-exports adapters + the `version-resolve` orchestration (`resolve_latest_stable(&dyn HttpClient) -> Result<ReleaseInfo, SourceError>`). | scaffold, version-resolve |
 | `src/adapters/http.rs` | adapter | `HttpClient` trait + `RealHttp` (ureq) + serde structs for GitHub Releases / build-info. | http-adapter |
 | `src/adapters/runner.rs` | adapter | `CommandRunner` trait + `RealRunner` (`std::process::Command`) + `CmdOutput`. | runner-adapter |
@@ -228,6 +228,29 @@ Notes for the coder:
   paths or running root package managers). The host checks it and surfaces the requirement (FR-12);
   the tool never self-elevates.
 
+### 6.1 Per-OS + method uninstall command table (ADR-0007)
+
+`build_uninstall_plan(method, os)` follows the same pure-table discipline. Note `winget uninstall`
+does **not** accept `--accept-package-agreements` (install/upgrade-only flag).
+
+| OS | Method | program | args | requires_elevation | post_steps |
+|----|--------|---------|------|--------------------|------------|
+| Windows | Winget | `winget` | `uninstall --id Microsoft.PowerShell --silent --accept-source-agreements` | no | — |
+| Windows | MSIX / Store | `winget` | the same, plus `--source msstore` | no | — |
+| Windows | MSI | `winget` | `uninstall --id Microsoft.PowerShell --silent --accept-source-agreements` | yes | — |
+| Windows | Chocolatey | `choco` | `uninstall powershell-core -y` | yes | — |
+| macOS | Homebrew | `brew` | `uninstall powershell` | no | — |
+| macOS | `.pkg` | `rm` | `-rf /usr/local/microsoft/powershell /usr/local/bin/pwsh` (Microsoft's documented removal; no manager exists for `.pkg`) | yes | `pkgutil --forget com.microsoft.powershell` (best-effort receipt cleanup) |
+| Linux | apt/dpkg | `apt-get` | `remove -y powershell` (`remove`, not `purge`: `/etc` config kept) | yes | — |
+| Linux | dnf/rpm | `dnf` | `remove -y powershell` | yes | — |
+| Linux | snap | `snap` | `remove powershell` | yes | — |
+| Linux | portable tar.gz | (in-process delete) | reported as `pwsh-autoupdate --uninstall --yes`; deletes the layout-gated install dir via `adapters::portable::remove_portable` — never a PATH self-spawn | depends on dir ownership | — |
+
+Portable notes: only the layout-recognized install directory is deleted (the same pure gate as the
+replace path, `core::portable::install_dir_from_binary`). In the versioned layout the now-empty
+`powershell/` root is cleaned up with a NON-recursive delete (a sibling version keeps it). Symlinks
+and PATH entries (e.g. `~/.local/bin/pwsh`) are not tracked and not removed; the host prints a note.
+
 ## 7. Orchestration flow (host, in `lib.rs` / `main.rs`)
 
 Two entry points, both taking `&dyn HttpClient` + `&dyn CommandRunner` so tests inject fakes:
@@ -256,6 +279,27 @@ run_update(http, runner, os):
   out = runner.run(plan.program, &plan.args)?       // the ONLY mutating call
   if out.status != 0 -> surface stderr, exit non-zero (never report success)  // FR-6
   exit 0
+
+run_uninstall(runner, os, elevated, assume_yes, input):  // ADR-0007; NO HttpClient — no network read
+  // `input` = stdin ONLY when it is a real terminal (host checks IsTerminal)
+  signals = probe(runner, os)
+  if !signals.pwsh_present -> "Nothing to uninstall.", exit 0 (idempotent no-op)
+  current = parse_version_leniently(signals.current_version)  // Option; `unknown` never blocks
+  detection = detect::resolve(signals)
+  if undetermined -> "uninstall manually", exit non-zero, no action
+  plan = plan::build_uninstall_plan(method, os)
+  print(UninstallReport)                            // the user confirms exactly this command (FR-9)
+  if !assume_yes:
+    if input is a terminal -> ask "Proceed with the uninstall? [y/N]"; not an explicit yes -> "Aborted", exit 1
+    else -> refuse: piped stdin is never consent; "re-run with --uninstall --yes", exit 1
+  if method == PortableTarGz -> portable::remove_portable in-process, exit 0/non-zero
+  if plan.requires_elevation && !elevated -> surface requirement, exit non-zero  // FR-12
+  if !runner.exists(plan.program) -> name it, exit non-zero, no other channel    // FR-6
+  out = runner.run(plan.program, &plan.args)        // the ONLY mutating call
+  // don't trust the exit code in either direction (mirror of the update verify):
+  if out.status != 0 -> re-probe; pwsh absent -> success + transparency line, else fail  // FR-6
+  if out.status == 0 -> post_steps; re-probe; pwsh still present -> informational note
+  exit 0
 ```
 
 ## 8. Exit-code contract (ADR-0002)
@@ -267,6 +311,8 @@ run_update(http, runner, os):
 | `--check` | 2 | error (network/API/parse failure, or undetermined-state error) |
 | full run | 0 | success (including up-to-date no-op) |
 | full run | non-zero | failure (manager non-zero, manager missing, OS unsupported, pwsh absent, elevation required) |
+| `--uninstall` | 0 | uninstalled (verified by re-probe; confirmed at the prompt or via `--yes`), or nothing to uninstall |
+| `--uninstall` | 1 | aborted at the prompt, `--yes` required but stdin is not a terminal, method undetermined, or the removal failed (manager failed and pwsh still present, elevation required, manager missing) |
 
 `main.rs` is the single place that maps the orchestration `Result`/state to `std::process::exit`.
 Documented in the README (FR-13). Never `unwrap`/`expect` on IO — convert to `Result`, print a
@@ -309,3 +355,4 @@ readable message to stderr, map to the non-zero code.
 - ADR-0003 — stable-only prerelease policy (`version.rs` classify).
 - ADR-0004 — multi-method precedence (`detect.rs` resolution; §6 selection).
 - ADR-0005 — technology stack & pinned dependencies (this increment; see `docs/adr/0005-*`).
+- ADR-0007 — uninstall via the owning channel (§6.1; `--uninstall` with interactive confirmation, `--yes` to skip).

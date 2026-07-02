@@ -11,7 +11,7 @@
 //! not here — core only fixes the program/args shape.
 
 use crate::core::error::PlanError;
-use crate::core::{InstallMethod, InstallPlan, Os, PlanCommand, UpdatePlan};
+use crate::core::{InstallMethod, InstallPlan, Os, PlanCommand, UninstallPlan, UpdatePlan};
 use semver::Version;
 
 /// Resolve the NATIVE from-scratch install command for `os`, given which manager
@@ -213,6 +213,124 @@ pub fn build_plan(
     })
 }
 
+/// Build the uninstall plan for the selected method on the given OS (ADR-0007).
+///
+/// The same command table discipline as [`build_plan`]: the exact `program` +
+/// `args` are fixed here so unit tests assert them and the preview shows
+/// exactly what would run (FR-9 agreement). Returns
+/// [`PlanError::UnsupportedCombination`] for a `(method, os)` pair with no
+/// defined removal procedure.
+pub fn build_uninstall_plan(method: InstallMethod, os: Os) -> Result<UninstallPlan, PlanError> {
+    // NOTE: `winget uninstall` accepts `--accept-source-agreements` but NOT
+    // `--accept-package-agreements` (an install/upgrade-only flag) — do not
+    // copy the upgrade rows' flag set verbatim.
+    let (program, args, requires_elevation): (&str, &[&str], bool) = match (os, method) {
+        // --- Windows ---------------------------------------------------------
+        (Os::Windows, InstallMethod::Winget) => (
+            "winget",
+            &[
+                "uninstall",
+                "--id",
+                "Microsoft.PowerShell",
+                "--silent",
+                "--accept-source-agreements",
+            ],
+            false, // per-user winget scope
+        ),
+        (Os::Windows, InstallMethod::Msix) => (
+            "winget",
+            &[
+                "uninstall",
+                "--id",
+                "Microsoft.PowerShell",
+                "--source",
+                "msstore",
+                "--silent",
+                "--accept-source-agreements",
+            ],
+            false,
+        ),
+        (Os::Windows, InstallMethod::Msi) => (
+            "winget",
+            &[
+                "uninstall",
+                "--id",
+                "Microsoft.PowerShell",
+                "--silent",
+                "--accept-source-agreements",
+            ],
+            true, // MSI removal touches machine-scope system paths
+        ),
+        (Os::Windows, InstallMethod::Chocolatey) => {
+            ("choco", &["uninstall", "powershell-core", "-y"], true)
+        }
+
+        // --- macOS -----------------------------------------------------------
+        (Os::Macos, InstallMethod::Homebrew) => ("brew", &["uninstall", "powershell"], false),
+        (Os::Macos, InstallMethod::MacPkg) => (
+            // Fixed procedure: no package manager exists for a `.pkg` install.
+            // Microsoft's documented removal is deleting these two fixed paths;
+            // the receipt cleanup (`pkgutil --forget`) is a post-step.
+            "rm",
+            &[
+                "-rf",
+                "/usr/local/microsoft/powershell",
+                "/usr/local/bin/pwsh",
+            ],
+            true,
+        ),
+
+        // --- Linux -----------------------------------------------------------
+        (Os::Linux, InstallMethod::AptDpkg) => {
+            // `remove`, not `purge`: keep system config under /etc recoverable.
+            ("apt-get", &["remove", "-y", "powershell"], true)
+        }
+        (Os::Linux, InstallMethod::DnfRpm) => ("dnf", &["remove", "-y", "powershell"], true),
+        (Os::Linux, InstallMethod::Snap) => ("snap", &["remove", "powershell"], true),
+        (Os::Linux, InstallMethod::PortableTarGz) => (
+            // Fixed procedure: delete the layout-gated portable install dir.
+            // The command names the documented flag form (FR-9: running it
+            // manually does exactly this), but the uninstall path executes the
+            // same routine IN-PROCESS — it never PATH-spawns itself. Privilege
+            // needs depend on who owns the install dir; the adapter surfaces
+            // the FR-12 elevation error when the dir is not writable.
+            "pwsh-autoupdate",
+            &["--uninstall", "--yes"],
+            false,
+        ),
+
+        // --- Cross-OS mismatches are unsupported ----------------------------
+        (os, method) => {
+            return Err(PlanError::UnsupportedCombination {
+                method: format!("{method:?}"),
+                os: format!("{os:?}"),
+            })
+        }
+    };
+
+    // Receipt cleanup after the .pkg payload is removed: cosmetic (the files
+    // are already gone), so it is a best-effort post-step, not part of the
+    // primary command.
+    let post_steps: Vec<PlanCommand> = match (os, method) {
+        (Os::Macos, InstallMethod::MacPkg) => vec![PlanCommand {
+            program: "pkgutil".to_string(),
+            args: ["--forget", "com.microsoft.powershell"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }],
+        _ => Vec::new(),
+    };
+
+    Ok(UninstallPlan {
+        method,
+        program: program.to_string(),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        requires_elevation,
+        post_steps,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +525,162 @@ mod tests {
             PlanError::UnsupportedCombination { method, os } => {
                 assert_eq!(method, "Winget");
                 assert_eq!(os, "Linux");
+            }
+        }
+    }
+
+    // --- uninstall plans (ADR-0007) ------------------------------------------
+
+    fn uplan(method: InstallMethod, os: Os) -> UninstallPlan {
+        build_uninstall_plan(method, os).unwrap()
+    }
+
+    #[test]
+    fn winget_uninstall_plan() {
+        let p = uplan(InstallMethod::Winget, Os::Windows);
+        assert_eq!(p.program, "winget");
+        assert_eq!(
+            p.args,
+            vec![
+                "uninstall",
+                "--id",
+                "Microsoft.PowerShell",
+                "--silent",
+                "--accept-source-agreements"
+            ]
+        );
+        assert!(!p.requires_elevation);
+    }
+
+    #[test]
+    fn msix_uninstall_plan_routes_through_msstore() {
+        let p = uplan(InstallMethod::Msix, Os::Windows);
+        assert_eq!(p.program, "winget");
+        assert!(p.args.iter().any(|a| a == "msstore"));
+        assert!(!p.requires_elevation);
+    }
+
+    #[test]
+    fn msi_uninstall_plan_requires_elevation() {
+        let p = uplan(InstallMethod::Msi, Os::Windows);
+        assert_eq!(p.program, "winget");
+        assert!(p.requires_elevation);
+    }
+
+    #[test]
+    fn winget_uninstall_plans_omit_the_package_agreements_flag() {
+        // `winget uninstall` rejects `--accept-package-agreements` (that flag is
+        // install/upgrade-only); passing it makes every uninstall fail.
+        for method in [
+            InstallMethod::Winget,
+            InstallMethod::Msix,
+            InstallMethod::Msi,
+        ] {
+            let p = uplan(method, Os::Windows);
+            assert!(
+                !p.args.iter().any(|a| a == "--accept-package-agreements"),
+                "{method:?} uninstall must not carry --accept-package-agreements"
+            );
+        }
+    }
+
+    #[test]
+    fn choco_uninstall_plan() {
+        let p = uplan(InstallMethod::Chocolatey, Os::Windows);
+        assert_eq!(p.program, "choco");
+        assert_eq!(p.args, vec!["uninstall", "powershell-core", "-y"]);
+        assert!(p.requires_elevation);
+    }
+
+    #[test]
+    fn brew_uninstall_plan() {
+        let p = uplan(InstallMethod::Homebrew, Os::Macos);
+        assert_eq!(p.program, "brew");
+        assert_eq!(p.args, vec!["uninstall", "powershell"]);
+        assert!(!p.requires_elevation);
+    }
+
+    #[test]
+    fn macpkg_uninstall_removes_documented_paths_and_forgets_receipt() {
+        // No manager exists for a .pkg install; the plan encodes Microsoft's
+        // documented removal (fixed paths) plus receipt cleanup as a post-step.
+        let p = uplan(InstallMethod::MacPkg, Os::Macos);
+        assert_eq!(p.program, "rm");
+        assert_eq!(
+            p.args,
+            vec![
+                "-rf",
+                "/usr/local/microsoft/powershell",
+                "/usr/local/bin/pwsh"
+            ]
+        );
+        assert!(p.requires_elevation);
+        assert_eq!(p.post_steps.len(), 1);
+        assert_eq!(p.post_steps[0].program, "pkgutil");
+        assert_eq!(
+            p.post_steps[0].args,
+            vec!["--forget", "com.microsoft.powershell"]
+        );
+    }
+
+    #[test]
+    fn apt_uninstall_plan_removes_not_purges() {
+        let p = uplan(InstallMethod::AptDpkg, Os::Linux);
+        assert_eq!(p.program, "apt-get");
+        // `remove` keeps /etc config; `purge` is deliberately not used.
+        assert_eq!(p.args, vec!["remove", "-y", "powershell"]);
+        assert!(p.requires_elevation);
+    }
+
+    #[test]
+    fn dnf_uninstall_plan() {
+        let p = uplan(InstallMethod::DnfRpm, Os::Linux);
+        assert_eq!(p.program, "dnf");
+        assert_eq!(p.args, vec!["remove", "-y", "powershell"]);
+        assert!(p.requires_elevation);
+    }
+
+    #[test]
+    fn snap_uninstall_plan() {
+        let p = uplan(InstallMethod::Snap, Os::Linux);
+        assert_eq!(p.program, "snap");
+        assert_eq!(p.args, vec!["remove", "powershell"]);
+        assert!(p.requires_elevation);
+    }
+
+    #[test]
+    fn portable_targz_uninstall_plan() {
+        let p = uplan(InstallMethod::PortableTarGz, Os::Linux);
+        // Modeled as the documented self-invoked flag form; executed in-process.
+        assert_eq!(p.program, "pwsh-autoupdate");
+        assert_eq!(p.args, vec!["--uninstall", "--yes"]);
+        assert!(!p.requires_elevation);
+    }
+
+    #[test]
+    fn non_macpkg_uninstall_plans_have_no_post_steps() {
+        assert!(uplan(InstallMethod::Winget, Os::Windows)
+            .post_steps
+            .is_empty());
+        assert!(uplan(InstallMethod::Homebrew, Os::Macos)
+            .post_steps
+            .is_empty());
+        assert!(uplan(InstallMethod::AptDpkg, Os::Linux)
+            .post_steps
+            .is_empty());
+        assert!(uplan(InstallMethod::Snap, Os::Linux).post_steps.is_empty());
+        assert!(uplan(InstallMethod::PortableTarGz, Os::Linux)
+            .post_steps
+            .is_empty());
+    }
+
+    #[test]
+    fn uninstall_cross_os_mismatch_is_unsupported() {
+        let err = build_uninstall_plan(InstallMethod::Homebrew, Os::Windows).unwrap_err();
+        match err {
+            PlanError::UnsupportedCombination { method, os } => {
+                assert_eq!(method, "Homebrew");
+                assert_eq!(os, "Windows");
             }
         }
     }

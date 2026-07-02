@@ -1,7 +1,7 @@
 //! CLI surface (`clap` derive). Parsing only — no domain logic here. The host
 //! hands the typed args to the orchestration layer (`run_check` / `run_update`).
 //!
-//! Three mutually-distinct run modes are exposed:
+//! Four mutually-distinct run modes are exposed:
 //! * default (no flag): the update path — detect the owning manager and run
 //!   the upgrade command (a mutating path).
 //! * `--check`: a read-only dry run — report current/latest version, detected
@@ -9,6 +9,9 @@
 //! * `--replace-portable`: the portable tar.gz download-and-replace (Linux) —
 //!   the command the update path reports for a portable install, runnable
 //!   directly (a mutating path).
+//! * `--uninstall`: remove PowerShell via the owning manager (a mutating
+//!   path). Asks for interactive confirmation; `--yes` skips the prompt and is
+//!   required when stdin is not a terminal.
 //!
 //! `--verbose` only toggles extra diagnostic output; it carries no domain logic.
 
@@ -33,6 +36,19 @@ pub struct Cli {
     /// manager.
     #[arg(long, conflicts_with = "check")]
     pub replace_portable: bool,
+
+    /// Uninstall PowerShell via the package manager that owns the install
+    /// (destructive). Shows the exact command and asks for confirmation;
+    /// pass --yes to skip the prompt (required when stdin is not a terminal).
+    #[arg(long, conflicts_with_all = ["check", "replace_portable"])]
+    pub uninstall: bool,
+
+    /// Skip the interactive uninstall confirmation (assume "yes").
+    // The explicit conflicts matter: clap drops a `requires` constraint when
+    // the required arg conflicts with a present one, so without them
+    // `--check --yes` would parse.
+    #[arg(long, short = 'y', requires = "uninstall", conflicts_with_all = ["check", "replace_portable"])]
+    pub yes: bool,
 
     /// Print additional diagnostic detail to stderr.
     #[arg(long, short)]
@@ -70,6 +86,35 @@ mod tests {
     fn replace_portable_conflicts_with_check() {
         // A dry run that mutates is a contradiction; the two flags never combine.
         assert!(Cli::try_parse_from(["pwsh-autoupdate", "--check", "--replace-portable"]).is_err());
+    }
+
+    #[test]
+    fn parses_uninstall_flag() {
+        let cli = Cli::parse_from(["pwsh-autoupdate", "--uninstall"]);
+        assert!(cli.uninstall);
+        assert!(!cli.yes);
+    }
+
+    #[test]
+    fn parses_uninstall_with_yes_long_and_short() {
+        assert!(Cli::parse_from(["pwsh-autoupdate", "--uninstall", "--yes"]).yes);
+        assert!(Cli::parse_from(["pwsh-autoupdate", "--uninstall", "-y"]).yes);
+    }
+
+    #[test]
+    fn uninstall_conflicts_with_check_and_replace_portable() {
+        // The unconfirmed `--uninstall` IS the dry run; `--check` never combines.
+        assert!(Cli::try_parse_from(["pwsh-autoupdate", "--uninstall", "--check"]).is_err());
+        assert!(
+            Cli::try_parse_from(["pwsh-autoupdate", "--uninstall", "--replace-portable"]).is_err()
+        );
+    }
+
+    #[test]
+    fn yes_requires_uninstall() {
+        // `--yes` confirms an uninstall; alone it confirms nothing.
+        assert!(Cli::try_parse_from(["pwsh-autoupdate", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["pwsh-autoupdate", "--check", "--yes"]).is_err());
     }
 
     #[test]

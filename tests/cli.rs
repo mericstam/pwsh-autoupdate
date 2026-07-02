@@ -34,6 +34,74 @@ fn shows_version() {
         .success();
 }
 
+#[test]
+fn help_mentions_uninstall() {
+    Command::cargo_bin("pwsh-autoupdate")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--uninstall"))
+        .stdout(predicate::str::contains("--yes"));
+}
+
+#[test]
+fn uninstall_conflicts_with_check() {
+    Command::cargo_bin("pwsh-autoupdate")
+        .unwrap()
+        .args(["--uninstall", "--check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn yes_without_uninstall_is_rejected() {
+    Command::cargo_bin("pwsh-autoupdate")
+        .unwrap()
+        .arg("--yes")
+        .assert()
+        .failure();
+}
+
+/// `--uninstall` without `--yes` through the real binary (ADR-0007). Under the
+/// test harness stdin is a PIPE, not a terminal, so the binary must refuse to
+/// treat piped bytes as consent: whatever the host's install state, nothing may
+/// be removed. NEVER run `--uninstall --yes` in tests — it would really
+/// uninstall the host's pwsh.
+#[test]
+fn uninstall_without_yes_is_safe_on_any_host() {
+    let assert = Command::cargo_bin("pwsh-autoupdate")
+        .unwrap()
+        .arg("--uninstall")
+        // Even piped consent must not be honored — stdin is not a terminal.
+        .write_stdin("y\n")
+        .assert();
+
+    let output = assert.get_output();
+    let code = output.status.code().expect("process exited with a signal");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // 0 = nothing to uninstall (no pwsh); 1 = non-interactive refusal or
+    // undetermined method.
+    assert!(
+        matches!(code, 0 | 1),
+        "unexpected --uninstall exit code {code}; stdout={stdout:?} stderr={stderr:?}"
+    );
+    let expected = stdout.contains("Nothing to uninstall")
+        || stderr.contains("not an interactive terminal")
+        || stderr.contains("Uninstall PowerShell manually");
+    assert!(
+        expected,
+        "must state one of the honest outcomes; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        !stdout.contains("uninstalled successfully"),
+        "must never uninstall without a terminal confirmation or --yes; stdout={stdout:?}"
+    );
+}
+
 /// Recorded-realistic stub bodies. A high stable version (v7.6.99) so that when
 /// the host DOES have pwsh, an update is "available"; the assertions below do
 /// not depend on that, only on the HTTP-resolved value reaching the report.

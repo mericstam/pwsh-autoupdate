@@ -16,10 +16,11 @@ use crate::adapters::runner::CommandRunner;
 use crate::adapters::{portable, probe, resolve_latest_stable};
 use crate::core::error::CoreError;
 use crate::core::{
-    detect, plan, report::CheckReport, version, Detection, InstallMethod, Os, ReleaseInfo,
-    VersionState,
+    detect, plan,
+    report::{CheckReport, UninstallReport},
+    version, Detection, InstallMethod, Os, ReleaseInfo, VersionState,
 };
-use std::io::Write;
+use std::io::{BufRead, Write};
 
 /// `User-Agent` sent on every upstream request (GitHub rejects requests with
 /// none). Identifies the tool + version for upstream operators.
@@ -357,7 +358,7 @@ pub fn run_update_with(
     let arg_refs: Vec<&str> = plan.args.iter().map(String::as_str).collect();
     match runner.run(&plan.program, &arg_refs) {
         Ok(output) if output.status == 0 => {
-            run_post_steps(runner, &plan, out, err);
+            run_post_steps(runner, &plan.post_steps, out, err);
             let _ = writeln!(
                 out,
                 "PowerShell updated successfully to {}.",
@@ -383,7 +384,7 @@ pub fn run_update_with(
                 .unwrap_or(false);
 
             if verified {
-                run_post_steps(runner, &plan, out, err);
+                run_post_steps(runner, &plan.post_steps, out, err);
                 let _ = writeln!(
                     out,
                     "PowerShell updated successfully to {} ('{}' exited with status {}, but the installed version now matches the target).",
@@ -501,6 +502,241 @@ pub fn run_replace_portable(
     portable_update(http, runner, &latest, out, err)
 }
 
+/// The `--uninstall` path (ADR-0007): remove PowerShell via the channel that
+/// owns the install.
+///
+/// Builds the real privilege check and delegates to [`run_uninstall_with`].
+/// `assume_yes` is the CLI's `--yes`; `input` is the interactive confirmation
+/// source (`Some(stdin)` only when stdin is a real terminal — see `main.rs`).
+/// Without `--yes` the report is printed and the user is asked to confirm;
+/// declining (or lacking a terminal to ask on) removes nothing and exits 1.
+pub fn run_uninstall(
+    runner: &dyn CommandRunner,
+    os: Os,
+    assume_yes: bool,
+    input: Option<&mut dyn BufRead>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    run_uninstall_with(
+        runner,
+        os,
+        has_elevated_privileges(),
+        assume_yes,
+        input,
+        out,
+        err,
+    )
+}
+
+/// The uninstall flow with the privilege state injected (testable).
+///
+/// Performs NO network read — removing PowerShell never needs the latest
+/// version. Flow:
+/// 1. probe; pwsh absent → idempotent no-op, exit 0 (the desired end state
+///    already holds).
+/// 2. parse the current version leniently — an unparseable version renders as
+///    `unknown` and must not block an uninstall that does not depend on it.
+/// 3. method undetermined → report, exit non-zero, attempt no removal.
+/// 4. build the uninstall plan and print the report BEFORE any confirmation
+///    (FR-9: the user confirms exactly the command that will run).
+/// 5. no `--yes` → ask `Proceed with the uninstall? [y/N]` on the terminal;
+///    anything but an explicit yes aborts with nothing removed, exit 1. When
+///    stdin is NOT a terminal (`input` is `None` — a pipe/CI), refuse and
+///    point at `--yes` instead of consuming piped bytes as consent.
+/// 6. portable tar.gz → delete the layout-gated install dir IN-PROCESS (never
+///    PATH-spawn ourselves).
+/// 7. `requires_elevation && !elevated` → surface, exit non-zero, NEVER
+///    self-elevate (FR-12).
+/// 8. manager not on PATH → name it, exit non-zero, try no other channel (FR-6).
+/// 9. run the command; do not trust its exit code in either direction — a
+///    non-zero exit re-probes and succeeds only if pwsh is actually gone; a
+///    zero exit with a pwsh still present (another channel's install) gets an
+///    informational note, not a failure.
+pub fn run_uninstall_with(
+    runner: &dyn CommandRunner,
+    os: Os,
+    elevated: bool,
+    assume_yes: bool,
+    input: Option<&mut dyn BufRead>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let signals = probe::probe(runner, os);
+
+    if !signals.pwsh_present {
+        let _ = writeln!(out, "PowerShell is not installed. Nothing to uninstall.");
+        return EXIT_SUCCESS;
+    }
+
+    // Lenient: uninstalling needs no version; `unknown` is honest, not fatal.
+    let current = signals
+        .current_version
+        .as_deref()
+        .and_then(|raw| version::parse(raw).ok());
+
+    let detection = detect::resolve(os, &signals);
+    let method = match detection.selected {
+        Some(m) => m,
+        None => {
+            let _ = writeln!(
+                err,
+                "error: could not determine how PowerShell was installed; no uninstall command can be produced. Uninstall PowerShell manually."
+            );
+            return EXIT_FAILURE;
+        }
+    };
+
+    let plan = match plan::build_uninstall_plan(method, os) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return EXIT_FAILURE;
+        }
+    };
+
+    // Printed BEFORE the confirmation prompt so the user confirms exactly the
+    // command that will run (FR-9).
+    let report = UninstallReport {
+        current,
+        detection,
+        plan: plan.clone(),
+    };
+    let _ = writeln!(out, "{report}");
+
+    if !assume_yes {
+        match input {
+            Some(input) => {
+                // Interactive confirmation of exactly the command shown above.
+                // Default is No: only an explicit `y`/`yes` proceeds.
+                let _ = write!(out, "Proceed with the uninstall? [y/N] ");
+                let _ = out.flush();
+                let mut line = String::new();
+                let answered_yes = input.read_line(&mut line).is_ok() && {
+                    let a = line.trim();
+                    a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes")
+                };
+                if !answered_yes {
+                    let _ = writeln!(out, "Aborted. PowerShell was NOT uninstalled.");
+                    return EXIT_FAILURE;
+                }
+            }
+            None => {
+                // Not a terminal (pipe/CI): consent must be explicit, never
+                // inferred from whatever happens to be on stdin.
+                let _ = writeln!(
+                    err,
+                    "error: confirmation required but stdin is not an interactive terminal; re-run with `--uninstall --yes`. PowerShell was NOT uninstalled."
+                );
+                return EXIT_FAILURE;
+            }
+        }
+    }
+
+    // Portable tar.gz deletes the install dir IN-PROCESS. The plan reads
+    // `pwsh-autoupdate --uninstall --yes` (FR-9: running that command manually
+    // does exactly this), but we never spawn ourselves via a PATH lookup.
+    // Privilege needs are checked against the actual install dir at runtime.
+    if plan.method == InstallMethod::PortableTarGz {
+        return match portable::remove_portable(runner, out) {
+            Ok(dir) => {
+                let _ = writeln!(out, "PowerShell uninstalled successfully.");
+                let _ = writeln!(
+                    out,
+                    "note: PATH entries or symlinks pointing at {dir} (e.g. ~/.local/bin/pwsh) are not removed; delete them manually."
+                );
+                EXIT_SUCCESS
+            }
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}. PowerShell was not uninstalled.");
+                EXIT_FAILURE
+            }
+        };
+    }
+
+    // FR-12: surface a privilege requirement; never self-elevate.
+    if plan.requires_elevation && !elevated {
+        let _ = writeln!(
+            err,
+            "error: uninstalling PowerShell via {} requires elevated privileges. Re-run with elevation (e.g. sudo / an elevated shell); this tool will not self-elevate.",
+            method.label()
+        );
+        return EXIT_FAILURE;
+    }
+
+    // FR-6: the owning manager must be on PATH; do not fall back to another channel.
+    if !runner.exists(&plan.program) {
+        let _ = writeln!(
+            err,
+            "error: the required package manager '{}' (owning channel: {}) was not found on PATH; not attempting any other channel.",
+            plan.program,
+            method.label()
+        );
+        return EXIT_FAILURE;
+    }
+
+    let _ = writeln!(out, "Uninstalling PowerShell via {} ...", method.label());
+    let _ = writeln!(
+        out,
+        "Running: {}",
+        render_command(&plan.program, &plan.args)
+    );
+
+    // The ONLY mutating call.
+    let arg_refs: Vec<&str> = plan.args.iter().map(String::as_str).collect();
+    match runner.run(&plan.program, &arg_refs) {
+        Ok(output) if output.status == 0 => {
+            run_post_steps(runner, &plan.post_steps, out, err);
+            let _ = writeln!(out, "PowerShell uninstalled successfully.");
+            // A pwsh still on PATH after a clean removal means a second install
+            // through another channel — informational, never touched (FR-6).
+            let reprobed = probe::probe(runner, os);
+            if reprobed.pwsh_present {
+                let after = detect::resolve(os, &reprobed);
+                let _ = writeln!(
+                    out,
+                    "note: a pwsh is still present (detected: {}); it was installed through a different channel and was not touched.",
+                    after.selected.map(InstallMethod::label).unwrap_or("undetermined")
+                );
+            }
+            EXIT_SUCCESS
+        }
+        Ok(output) => {
+            // Do not trust a non-zero exit blindly: re-probe and report success
+            // only if PowerShell is actually gone (mirror of the update path's
+            // verify; never report success on a real failure, FR-6).
+            let reprobed = probe::probe(runner, os);
+            if !reprobed.pwsh_present {
+                run_post_steps(runner, &plan.post_steps, out, err);
+                let _ = writeln!(
+                    out,
+                    "PowerShell uninstalled successfully ('{}' exited with status {}, but pwsh is now absent).",
+                    plan.program, output.status
+                );
+                return EXIT_SUCCESS;
+            }
+
+            let _ = writeln!(
+                err,
+                "error: '{}' exited with status {}.",
+                plan.program, output.status
+            );
+            if !output.stderr.trim().is_empty() {
+                let _ = writeln!(err, "{}", output.stderr.trim_end());
+            }
+            EXIT_FAILURE
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "error: failed to run '{}': {e}. PowerShell was not uninstalled.",
+                plan.program
+            );
+            EXIT_FAILURE
+        }
+    }
+}
+
 /// Perform the portable download-and-replace to `latest` and map the outcome
 /// to an exit code. The adapter verifies the swapped-in binary reports the
 /// target version before discarding the previous install (and rolls back
@@ -529,20 +765,20 @@ fn portable_update(
     }
 }
 
-/// Run a plan's follow-up steps after the primary upgrade succeeded.
+/// Run a plan's follow-up steps after the primary command succeeded.
 ///
-/// These are best-effort self-healing steps (Homebrew's
-/// `brew link --overwrite powershell`, which repairs the `pwsh` symlink that
-/// `brew upgrade` leaves unlinked on a file conflict). The new version is
-/// already installed by the time we get here, so a failing step is surfaced as
-/// a WARNING with the manual remediation command — never as a failed update.
+/// These are best-effort steps (Homebrew's `brew link --overwrite powershell`
+/// after an upgrade, `pkgutil --forget` receipt cleanup after a .pkg removal).
+/// The primary operation has already succeeded by the time we get here, so a
+/// failing step is surfaced as a WARNING with the manual remediation command —
+/// never as a failed operation.
 fn run_post_steps(
     runner: &dyn CommandRunner,
-    plan: &crate::core::UpdatePlan,
+    steps: &[crate::core::PlanCommand],
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) {
-    for step in &plan.post_steps {
+    for step in steps {
         let display = render_command(&step.program, &step.args);
         let _ = writeln!(out, "Running: {display}");
         let arg_refs: Vec<&str> = step.args.iter().map(String::as_str).collect();
@@ -551,7 +787,7 @@ fn run_post_steps(
             Ok(o) => {
                 let _ = writeln!(
                     err,
-                    "warning: follow-up step '{display}' exited with status {}; PowerShell was updated but you may need to run `{display}` manually if `pwsh` still points at the old version.",
+                    "warning: follow-up step '{display}' exited with status {}; the operation succeeded but you may need to run `{display}` manually.",
                     o.status
                 );
                 if !o.stderr.trim().is_empty() {
@@ -561,7 +797,7 @@ fn run_post_steps(
             Err(e) => {
                 let _ = writeln!(
                     err,
-                    "warning: failed to run follow-up step '{display}': {e}; PowerShell was updated but you may need to run `{display}` manually if `pwsh` still points at the old version."
+                    "warning: failed to run follow-up step '{display}': {e}; the operation succeeded but you may need to run `{display}` manually."
                 );
             }
         }
@@ -753,10 +989,20 @@ mod tests {
         /// When set, `resolve_program_path` reports this as the canonical pwsh
         /// binary path — modelling a portable install at that location.
         resolved_pwsh: Option<String>,
+        /// When set, pwsh stops existing after a mutating invocation has run —
+        /// modelling a manager whose uninstall actually removed PowerShell (a
+        /// re-probe then sees it absent).
+        removes_pwsh: bool,
     }
     fn is_mutating_args(args: &[&str]) -> bool {
-        args.iter()
-            .any(|a| *a == "upgrade" || *a == "refresh" || *a == "install")
+        args.iter().any(|a| {
+            *a == "upgrade"
+                || *a == "refresh"
+                || *a == "install"
+                || *a == "uninstall"
+                || *a == "remove"
+                || *a == "-rf"
+        })
     }
     impl FakeRunner {
         fn fail_upgrade(mut self, status: i32, stderr: &str) -> Self {
@@ -771,6 +1017,18 @@ mod tests {
         fn upgrades_to(mut self, version_line: &str) -> Self {
             self.post_upgrade_version = Some(version_line.to_string());
             self
+        }
+        /// After any mutating call, pwsh no longer exists (uninstall took).
+        fn removes_pwsh(mut self) -> Self {
+            self.removes_pwsh = true;
+            self
+        }
+        /// Whether a mutating invocation has been recorded so far.
+        fn has_mutating_run(&self) -> bool {
+            self.runs.borrow().iter().any(|(_, a)| {
+                let refs: Vec<&str> = a.iter().map(String::as_str).collect();
+                is_mutating_args(&refs)
+            })
         }
         /// Model the canonical on-disk location of the pwsh binary (portable
         /// installs resolve to a real path inside the install tree).
@@ -843,7 +1101,7 @@ mod tests {
                 }
             }
             if let Some((status, stderr)) = &self.fail_post_step {
-                if args.contains(&"link") {
+                if args.contains(&"link") || args.contains(&"--forget") {
                     return Ok(crate::adapters::runner::CmdOutput {
                         status: *status,
                         stdout: String::new(),
@@ -856,6 +1114,9 @@ mod tests {
             })
         }
         fn exists(&self, program: &str) -> bool {
+            if self.removes_pwsh && program == probe::pwsh_exe() && self.has_mutating_run() {
+                return false;
+            }
             self.present.contains(program)
         }
         fn resolve_program_path(&self, _program: &str) -> Option<String> {
@@ -1263,6 +1524,364 @@ mod tests {
         assert!(!stdout.contains("installed successfully"));
         assert!(stderr.contains("install via snap failed"));
         assert!(stderr.contains("snap: install failed"));
+    }
+
+    // --- run_uninstall path (ADR-0007) ----------------------------------------
+
+    /// A canned interactive answer for the confirmation prompt.
+    fn answering(s: &str) -> std::io::Cursor<Vec<u8>> {
+        std::io::Cursor::new(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn uninstall_prompt_declined_shows_command_runs_nothing_and_exits_1() {
+        // No --yes, user answers "n": the report shows exactly what would run,
+        // and the abort mutates NOTHING.
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("dpkg", "Package: powershell\nStatus: install ok installed");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut input = answering("n\n");
+        let code = run_uninstall_with(
+            &runner,
+            Os::Linux,
+            true,
+            false,
+            Some(&mut input),
+            &mut out,
+            &mut err,
+        );
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(code, EXIT_FAILURE);
+        assert!(stdout.contains("Current version: 7.4.0"));
+        assert!(stdout.contains("Detected method: apt/dpkg"));
+        assert!(stdout.contains("Would run:       apt-get remove -y powershell"));
+        assert!(stdout.contains("Proceed with the uninstall? [y/N]"));
+        assert!(stdout.contains("Aborted. PowerShell was NOT uninstalled."));
+        assert!(
+            mutating_runs(&runner).is_empty(),
+            "a declined prompt must run no mutating commands, saw {:?}",
+            mutating_runs(&runner)
+        );
+    }
+
+    #[test]
+    fn uninstall_prompt_empty_answer_defaults_to_no() {
+        // Just pressing Enter must NOT uninstall — the default is No.
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("dpkg", "Package: powershell\nStatus: install ok installed");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut input = answering("\n");
+        let code = run_uninstall_with(
+            &runner,
+            Os::Linux,
+            true,
+            false,
+            Some(&mut input),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, EXIT_FAILURE);
+        assert!(String::from_utf8(out).unwrap().contains("Aborted"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn uninstall_prompt_accepted_proceeds_without_yes_flag() {
+        // User answers "y" at the prompt: the uninstall runs exactly as if
+        // --yes had been passed.
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("brew", "powershell")
+            .removes_pwsh();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut input = answering("y\n");
+        let code = run_uninstall_with(
+            &runner,
+            Os::Macos,
+            false,
+            false,
+            Some(&mut input),
+            &mut out,
+            &mut err,
+        );
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(stdout.contains("Proceed with the uninstall? [y/N]"));
+        assert!(stdout.contains("uninstalled successfully"));
+        assert_eq!(
+            mutating_runs(&runner),
+            vec![(
+                "brew".to_string(),
+                vec!["uninstall".to_string(), "powershell".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn uninstall_without_terminal_and_without_yes_refuses() {
+        // stdin is not a terminal (input None) and no --yes: consent cannot be
+        // asked for, so nothing runs and the error points at --yes.
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("dpkg", "Package: powershell\nStatus: install ok installed");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Linux, true, false, None, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_FAILURE);
+        assert!(stderr.contains("not an interactive terminal"));
+        assert!(stderr.contains("--uninstall --yes"));
+        assert!(stderr.contains("PowerShell was NOT uninstalled"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn uninstall_confirmed_runs_owning_manager_command_and_exits_0() {
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("brew", "powershell")
+            .removes_pwsh();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Macos, false, true, None, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(stdout.contains("uninstalled successfully"));
+        // FR-9 agreement: exactly the reported command ran, once.
+        let muts = mutating_runs(&runner);
+        assert_eq!(
+            muts,
+            vec![(
+                "brew".to_string(),
+                vec!["uninstall".to_string(), "powershell".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn uninstall_elevation_required_but_absent_surfaces_and_runs_nothing() {
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("dpkg", "Package: powershell\nStatus: install ok installed")
+            .with_manager("apt-get", "");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Linux, false, true, None, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(stderr.contains("elevated privileges"));
+        assert!(stderr.contains("will not self-elevate"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn uninstall_manager_missing_on_path_names_it_and_exits_nonzero() {
+        // dpkg owns pwsh (detected) but apt-get is not on PATH.
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("dpkg", "Package: powershell\nStatus: install ok installed");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Linux, true, true, None, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(stderr.contains("apt-get"));
+        assert!(stderr.contains("not found on PATH"));
+        assert!(stderr.contains("not attempting any other channel"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn uninstall_manager_nonzero_exit_and_pwsh_still_present_fails() {
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("brew", "powershell")
+            .fail_upgrade(1, "brew: uninstall failed: locked");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Macos, false, true, None, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(!stdout.contains("uninstalled successfully"));
+        assert!(stderr.contains("exited with status 1"));
+        assert!(stderr.contains("uninstall failed"));
+    }
+
+    #[test]
+    fn uninstall_nonzero_exit_but_pwsh_gone_reports_success() {
+        // The manager exited non-zero but the re-probe shows pwsh is actually
+        // gone -> success with a transparency line (verify the outcome, don't
+        // trust the exit code — mirror of the update path's winget quirk).
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("brew", "powershell")
+            .fail_upgrade(1, "harmless post-remove hiccup")
+            .removes_pwsh();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Macos, false, true, None, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(stdout.contains("uninstalled successfully"));
+        assert!(stdout.contains("exited with status 1, but pwsh is now absent"));
+        assert!(!stderr.contains("error:"));
+    }
+
+    #[test]
+    fn uninstall_zero_exit_but_pwsh_still_present_notes_other_channel() {
+        // Clean removal, but another channel's pwsh is still first on PATH ->
+        // success plus an informational note; the other install is not touched.
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0").with_manager("brew", "powershell");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Macos, false, true, None, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(stdout.contains("uninstalled successfully"));
+        assert!(stdout.contains("note: a pwsh is still present"));
+        assert!(stdout.contains("was not touched"));
+    }
+
+    #[test]
+    fn uninstall_pwsh_absent_is_idempotent_success() {
+        let runner = FakeRunner::default(); // pwsh not present
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Linux, false, true, None, &mut out, &mut err);
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("Nothing to uninstall"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn uninstall_undetermined_method_exits_nonzero_no_action() {
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0"); // no manager owns it
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Linux, true, true, None, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_ne!(code, EXIT_SUCCESS);
+        assert!(stderr.contains("could not determine how PowerShell was installed"));
+        assert!(stderr.contains("Uninstall PowerShell manually"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn uninstall_unparseable_version_still_proceeds() {
+        // Uninstalling needs no version; `unknown` is rendered, not fatal.
+        let runner = FakeRunner::pwsh("PowerShell nightly-build")
+            .with_manager("brew", "powershell")
+            .removes_pwsh();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Macos, false, true, None, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(stdout.contains("Current version: unknown"));
+        assert!(stdout.contains("uninstalled successfully"));
+    }
+
+    #[test]
+    fn uninstall_macpkg_removes_paths_then_forgets_receipt() {
+        // .pkg receipt detected, no brew -> MacPkg. The fixed rm procedure runs,
+        // then the best-effort receipt cleanup.
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("pkgutil", "com.microsoft.powershell")
+            .with_manager("rm", "")
+            .removes_pwsh();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Macos, true, true, None, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(
+            code,
+            EXIT_SUCCESS,
+            "stderr: {}",
+            String::from_utf8(err).unwrap()
+        );
+        assert!(stdout.contains("uninstalled successfully"));
+        let runs = runner.runs.borrow();
+        let rm_pos = runs
+            .iter()
+            .position(|(p, a)| p == "rm" && a.contains(&"-rf".to_string()))
+            .expect("rm -rf must run");
+        let forget_pos = runs
+            .iter()
+            .position(|(p, a)| p == "pkgutil" && a.contains(&"--forget".to_string()))
+            .expect("pkgutil --forget must run");
+        assert!(rm_pos < forget_pos, "receipt cleanup runs after removal");
+    }
+
+    #[test]
+    fn uninstall_macpkg_failed_receipt_cleanup_warns_but_still_succeeds() {
+        let runner = FakeRunner::pwsh("PowerShell 7.4.0")
+            .with_manager("pkgutil", "com.microsoft.powershell")
+            .with_manager("rm", "")
+            .fail_post_step(1, "No receipt for 'com.microsoft.powershell'")
+            .removes_pwsh();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Macos, true, true, None, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(stdout.contains("uninstalled successfully"));
+        assert!(stderr.contains("warning:"));
+        assert!(stderr.contains("pkgutil --forget com.microsoft.powershell"));
+        assert!(!stderr.contains("error:"));
+    }
+
+    #[test]
+    fn uninstall_portable_confirmed_deletes_install_dir_in_process() {
+        let (_td, install, binary) = portable_tree("old");
+        let runner = FakeRunner::pwsh("PowerShell 7.6.2").resolved_at(&binary);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_uninstall_with(&runner, Os::Linux, false, true, None, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(
+            code,
+            EXIT_SUCCESS,
+            "stderr: {}",
+            String::from_utf8(err).unwrap()
+        );
+        // FR-9: the reported command is the documented flag form.
+        assert!(stdout.contains("Would run:       pwsh-autoupdate --uninstall --yes"));
+        assert!(stdout.contains("uninstalled successfully"));
+        assert!(stdout.contains("are not removed; delete them manually"));
+        assert!(!install.exists(), "the install dir must be deleted");
+        // No subprocess named pwsh-autoupdate was ever spawned.
+        assert!(runner
+            .runs
+            .borrow()
+            .iter()
+            .all(|(p, _)| p != "pwsh-autoupdate"));
+    }
+
+    #[test]
+    fn uninstall_portable_declined_prompt_leaves_install_dir_intact() {
+        let (_td, install, binary) = portable_tree("old");
+        let runner = FakeRunner::pwsh("PowerShell 7.6.2").resolved_at(&binary);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut input = answering("n\n");
+        let code = run_uninstall_with(
+            &runner,
+            Os::Linux,
+            false,
+            false,
+            Some(&mut input),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, EXIT_FAILURE);
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("Aborted. PowerShell was NOT uninstalled."));
+        assert!(
+            install.exists(),
+            "a declined prompt must not delete anything"
+        );
     }
 
     // --- portable tar.gz path -------------------------------------------------
