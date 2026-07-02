@@ -1305,7 +1305,6 @@ mod tests {
             .all(|(p, _)| p != "pwsh-autoupdate"));
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replace_portable_happy_path_updates_and_exits_0() {
         use crate::adapters::portable::fixtures;
@@ -1313,13 +1312,18 @@ mod tests {
 
         let (_td, install, binary) = portable_tree("old-binary");
         let tarball = fixtures::payload_targz();
-        let asset = "powershell-7.6.3-linux-x64.tar.gz";
+        // Derive the asset the same way the adapter does (from the REAL host
+        // arch), so the test runs unchanged on x86_64 and aarch64 runners.
+        let asset = rules::asset_name(
+            &semver::Version::parse("7.6.3").unwrap(),
+            rules::arch_label(std::env::consts::ARCH).expect("test host arch"),
+        );
         let http = FakeHttp::ok("7.6.3")
             .raw(
                 &rules::hashes_url("v7.6.3"),
-                fixtures::manifest_utf16le(&[(&fixtures::sha256_hex(&tarball), asset)]),
+                fixtures::manifest_utf16le(&[(&fixtures::sha256_hex(&tarball), &asset)]),
             )
-            .raw(&rules::asset_url("v7.6.3", asset), tarball);
+            .raw(&rules::asset_url("v7.6.3", &asset), tarball);
         // Probe sees 7.6.2 via `pwsh`; the post-swap verify runs the binary by
         // its absolute path, which reports the new version.
         let runner = FakeRunner::pwsh("PowerShell 7.6.2")

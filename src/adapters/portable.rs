@@ -122,7 +122,10 @@ pub fn replace_portable(
     }
 
     // Sanity: the payload must actually contain the pwsh binary, executable.
-    let staged_pwsh = staging.join(probe::pwsh_exe());
+    // Hardcoded "pwsh" (not `pwsh_exe()`): this channel replaces a *Linux*
+    // portable payload, whose binary is always `pwsh`, regardless of the OS
+    // the code happens to be compiled for.
+    let staged_pwsh = staging.join("pwsh");
     if !staged_pwsh.is_file() {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(PortableError::UnsafeArchive {
@@ -483,27 +486,34 @@ mod tests {
         Version::parse(s).unwrap()
     }
 
-    const TARBALL_URL: &str =
-        "https://github.com/PowerShell/PowerShell/releases/download/v7.6.3/powershell-7.6.3-linux-x64.tar.gz";
-    const HASHES_URL: &str =
-        "https://github.com/PowerShell/PowerShell/releases/download/v7.6.3/hashes.sha256";
-    const ASSET: &str = "powershell-7.6.3-linux-x64.tar.gz";
+    // Asset selection follows the REAL host arch (the one probe passes to the
+    // pure rules), so the fixture asset/URLs are derived the same way — the
+    // tests run unchanged on x86_64 and aarch64 CI runners alike.
+    fn asset() -> String {
+        rules::asset_name(
+            &v("7.6.3"),
+            rules::arch_label(std::env::consts::ARCH).expect("test host arch has a portable build"),
+        )
+    }
+    fn tarball_url() -> String {
+        rules::asset_url("v7.6.3", &asset())
+    }
+    fn hashes_url() -> String {
+        rules::hashes_url("v7.6.3")
+    }
 
     fn http_serving(tarball: &[u8]) -> FakeHttp {
         FakeHttp::default()
             .with(
-                HASHES_URL,
+                &hashes_url(),
                 manifest_utf16le(&[
                     (&"a".repeat(64), "some-other-asset.zip"),
-                    (&sha256_hex(tarball), ASSET),
+                    (&sha256_hex(tarball), &asset()),
                 ]),
             )
-            .with(TARBALL_URL, tarball.to_vec())
+            .with(&tarball_url(), tarball.to_vec())
     }
 
-    // x86_64-only: asset selection follows the real host arch, and the fixture
-    // URLs above pin the x64 asset name.
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn happy_path_downloads_verifies_swaps_and_keeps_the_binary_path() {
         let tarball = payload_targz();
@@ -540,14 +550,16 @@ mod tests {
         assert!(stdout.contains("SHA-256 verified"));
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn hash_mismatch_refuses_and_leaves_install_untouched() {
         let tarball = payload_targz();
         // Manifest advertises a DIFFERENT hash for the asset.
         let http = FakeHttp::default()
-            .with(HASHES_URL, manifest_utf16le(&[(&"c".repeat(64), ASSET)]))
-            .with(TARBALL_URL, tarball);
+            .with(
+                &hashes_url(),
+                manifest_utf16le(&[(&"c".repeat(64), &asset())]),
+            )
+            .with(&tarball_url(), tarball);
         let (_td, _install, binary) = portable_install("old-binary");
         let runner = FakeRunner {
             resolved: Some(binary.clone()),
@@ -563,11 +575,10 @@ mod tests {
         assert!(runner.runs.borrow().is_empty());
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn missing_manifest_entry_refuses_before_downloading_the_asset() {
         let http = FakeHttp::default().with(
-            HASHES_URL,
+            &hashes_url(),
             manifest_utf16le(&[(&"a".repeat(64), "unrelated.zip")]),
         );
         // Note: no tarball URL registered — reaching it would error differently.
@@ -582,7 +593,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&binary).unwrap(), "old-binary");
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn archive_without_pwsh_at_root_is_rejected_and_rolled_back() {
         let tarball = targz(&[("readme.txt", b"not a shell" as &[u8], 0o644)]);
@@ -599,7 +609,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&binary).unwrap(), "old-binary");
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn verify_failure_rolls_the_previous_install_back() {
         // The swap succeeds but the new binary reports the OLD version (e.g. a
@@ -620,7 +629,6 @@ mod tests {
         assert!(install.is_dir());
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn non_portable_layout_is_refused() {
         // Binary resolves to a location outside any recognized portable tree.
