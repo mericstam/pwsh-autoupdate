@@ -72,18 +72,21 @@ jobs:
 
   # Generate the Homebrew formula + Scoop manifest from the just-published
   # release (correct per-asset SHA256s), attach them to the release, and — when
-  # the HOMEBREW_TAP_DEPLOY_KEY secret is configured — push the formula to the
-  # tap repo over SSH so `brew` stays current automatically. The secret is a
-  # deploy key scoped to ONLY the homebrew-tap repo (no account-wide access);
-  # this job only runs on tag pushes, which forks cannot trigger, so the key is
-  # never exposed to fork PRs. Without the secret it skips that step gracefully
-  # (the manifest is still attached to the release).
+  # the matching deploy-key secret is configured — push each to its distribution
+  # repo over SSH so `brew`/`scoop` stay current automatically:
+  #   * HOMEBREW_TAP_DEPLOY_KEY  -> mericstam/homebrew-tap  (Formula/)
+  #   * SCOOP_BUCKET_DEPLOY_KEY  -> mericstam/scoop-bucket  (bucket/)
+  # Each secret is a deploy key scoped to ONLY its target repo (no account-wide
+  # access); this job only runs on tag pushes, which forks cannot trigger, so the
+  # keys are never exposed to fork PRs. Without a secret the corresponding push
+  # is skipped gracefully (the manifest is still attached to the release).
   manifests:
     name: package-manager manifests
     needs: build
     runs-on: ubuntu-latest
     env:
       TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+      SCOOP_DEPLOY_KEY: ${{ secrets.SCOOP_BUCKET_DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Generate manifests
@@ -114,3 +117,22 @@ jobs:
           git commit -m "pwsh-autoupdate ${ver}" || { echo "tap already current"; exit 0; }
           git push
           rm -f ~/.ssh/tap_key
+      - name: Update Scoop bucket
+        if: ${{ env.SCOOP_DEPLOY_KEY != '' }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SCOOP_DEPLOY_KEY" > ~/.ssh/scoop_key
+          chmod 600 ~/.ssh/scoop_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/scoop_key -o IdentitiesOnly=yes"
+          git clone git@github.com:mericstam/scoop-bucket.git bucket
+          mkdir -p bucket/bucket
+          cp dist/pwsh-autoupdate.json bucket/bucket/pwsh-autoupdate.json
+          cd bucket
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/pwsh-autoupdate.json
+          git commit -m "pwsh-autoupdate ${ver}" || { echo "bucket already current"; exit 0; }
+          git push
+          rm -f ~/.ssh/scoop_key

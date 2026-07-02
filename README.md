@@ -23,8 +23,11 @@ brew install mericstam/tap/pwsh-autoupdate
 ### Scoop (Windows)
 
 ```powershell
-scoop install https://raw.githubusercontent.com/mericstam/pwsh-autoupdate/main/pkg/scoop/pwsh-autoupdate.json
+scoop bucket add mericstam https://github.com/mericstam/scoop-bucket
+scoop install mericstam/pwsh-autoupdate
 ```
+
+Upgrade later with `scoop update pwsh-autoupdate`.
 
 ### From source (any platform with a Rust toolchain)
 
