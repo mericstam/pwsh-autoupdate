@@ -13,6 +13,7 @@
 //! [`CoreError`]) and produces NO version value (FR-11).
 
 pub mod http;
+pub mod portable;
 pub mod probe;
 pub mod runner;
 
@@ -125,6 +126,9 @@ mod tests {
                 .get(url)
                 .cloned()
                 .ok_or_else(|| SourceError::Fetch(format!("no fake for {url}")))
+        }
+        fn get_bytes(&self, url: &str, _max_bytes: u64) -> Result<Vec<u8>, SourceError> {
+            self.get_text(url).map(String::into_bytes)
         }
     }
 

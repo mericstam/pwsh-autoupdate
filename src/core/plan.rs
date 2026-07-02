@@ -162,11 +162,15 @@ pub fn build_plan(
         (Os::Linux, InstallMethod::DnfRpm) => ("dnf", &["upgrade", "-y", "powershell"], true),
         (Os::Linux, InstallMethod::Snap) => ("snap", &["refresh", "powershell"], true),
         (Os::Linux, InstallMethod::PortableTarGz) => (
-            // Fixed procedure: download the latest tar.gz asset and replace the
-            // contents of the portable install dir. Elevation depends on who
-            // owns that dir; treat as not-required by default (a user-owned
-            // ~/powershell needs none) — the host surfaces a permission error
-            // if the replace fails on a root-owned dir.
+            // Fixed procedure: download the latest tar.gz asset, verify its
+            // SHA-256, and atomically replace the portable install dir. The
+            // command names the documented `--replace-portable` flag (FR-9:
+            // running it manually does exactly this), but the update path
+            // executes the same routine IN-PROCESS — it never PATH-spawns
+            // itself. Elevation depends on who owns the install dir; treat as
+            // not-required by default (a user-owned ~/powershell needs none) —
+            // the adapter surfaces the FR-12 elevation error when the dir is
+            // not writable.
             "pwsh-autoupdate",
             &["--replace-portable"],
             false,

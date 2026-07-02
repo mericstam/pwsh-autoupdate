@@ -36,6 +36,8 @@ fn main() -> ExitCode {
 
     let code = if cli.check {
         app::run_check(&http, &runner, os, &mut stdout, &mut stderr)
+    } else if cli.replace_portable {
+        app::run_replace_portable(&http, &runner, os, &mut stdout, &mut stderr)
     } else {
         app::run_update(&http, &runner, os, &mut stdout, &mut stderr)
     };

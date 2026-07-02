@@ -1,11 +1,14 @@
 //! CLI surface (`clap` derive). Parsing only — no domain logic here. The host
 //! hands the typed args to the orchestration layer (`run_check` / `run_update`).
 //!
-//! Two mutually-distinct run modes are exposed:
-//! * default (no `--check`): the update path — detect the owning manager and run
-//!   the upgrade command (the only mutating path).
+//! Three mutually-distinct run modes are exposed:
+//! * default (no flag): the update path — detect the owning manager and run
+//!   the upgrade command (a mutating path).
 //! * `--check`: a read-only dry run — report current/latest version, detected
 //!   method, and the exact command that *would* run, performing no update.
+//! * `--replace-portable`: the portable tar.gz download-and-replace (Linux) —
+//!   the command the update path reports for a portable install, runnable
+//!   directly (a mutating path).
 //!
 //! `--verbose` only toggles extra diagnostic output; it carries no domain logic.
 
@@ -21,6 +24,15 @@ pub struct Cli {
     /// effects). Exit code: 0 up-to-date, 1 update-available, 2 error.
     #[arg(long)]
     pub check: bool,
+
+    /// Update a portable tar.gz install of PowerShell (Linux only): download
+    /// the latest release tarball, verify its SHA-256 against the release hash
+    /// manifest, and atomically replace the existing portable install
+    /// directory. This is the command the default update path runs for a
+    /// portable install; refuses to touch an install owned by a package
+    /// manager.
+    #[arg(long, conflicts_with = "check")]
+    pub replace_portable: bool,
 
     /// Print additional diagnostic detail to stderr.
     #[arg(long, short)]
@@ -43,7 +55,21 @@ mod tests {
     fn defaults_to_update_path() {
         let cli = Cli::parse_from(["pwsh-autoupdate"]);
         assert!(!cli.check);
+        assert!(!cli.replace_portable);
         assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn parses_replace_portable_flag() {
+        let cli = Cli::parse_from(["pwsh-autoupdate", "--replace-portable"]);
+        assert!(cli.replace_portable);
+        assert!(!cli.check);
+    }
+
+    #[test]
+    fn replace_portable_conflicts_with_check() {
+        // A dry run that mutates is a contradiction; the two flags never combine.
+        assert!(Cli::try_parse_from(["pwsh-autoupdate", "--check", "--replace-portable"]).is_err());
     }
 
     #[test]

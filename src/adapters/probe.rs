@@ -83,8 +83,9 @@ fn read_pwsh_version(runner: &dyn CommandRunner, exe: &str) -> Option<String> {
 
 /// Extract the last whitespace-delimited token from a `pwsh --version` line
 /// (the version sits after the `PowerShell` product word). Returns `None` if
-/// the output is blank.
-fn extract_version_token(raw: &str) -> Option<String> {
+/// the output is blank. Shared with the portable-replace adapter, which runs
+/// the swapped-in binary to verify the update took.
+pub(crate) fn extract_version_token(raw: &str) -> Option<String> {
     let token = raw.split_whitespace().next_back()?;
     if token.is_empty() {
         None
@@ -195,31 +196,10 @@ fn portable_root_for(runner: &dyn CommandRunner) -> Option<String> {
         return Some(SYSTEM_PREFIX.to_string());
     }
     let resolved = runner.resolve_program_path(pwsh_exe())?;
-    portable_root_from_path(&resolved)
-}
-
-/// Given the resolved pwsh binary path, return the portable install root if the
-/// binary lives under a `.../powershell[/<version>]/pwsh` tree (the layout of a
-/// manual tar.gz / user-local extraction). Pure: no IO, so it unit-tests on any
-/// OS. Returns `None` for any other location (kept "undetermined" — never guess).
-fn portable_root_from_path(binary: &str) -> Option<String> {
-    let parent = std::path::Path::new(binary).parent()?;
-    let is_powershell_dir = |dir: &std::path::Path| {
-        dir.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("powershell"))
-    };
-    // Layout A: <root=powershell>/pwsh  (binary directly in a `powershell` dir).
-    if is_powershell_dir(parent) {
-        return Some(parent.to_string_lossy().into_owned());
-    }
-    // Layout B: <root=powershell>/<version>/pwsh  (versioned subdir — the common
-    // `~/.local/share/powershell/7.6.2/pwsh` and `/opt/microsoft/powershell/7`).
-    let grandparent = parent.parent()?;
-    if is_powershell_dir(grandparent) {
-        return Some(grandparent.to_string_lossy().into_owned());
-    }
-    None
+    // The layout-recognition rule is pure and shared with the portable-replace
+    // path (core::portable), so detection and replacement agree by construction
+    // on what counts as a portable install.
+    crate::core::portable::install_root_from_path(&resolved)
 }
 
 #[cfg(test)]
@@ -433,27 +413,8 @@ mod tests {
         assert_eq!(d.selected, Some(InstallMethod::PortableTarGz));
     }
 
-    #[test]
-    fn portable_root_from_path_recognizes_known_layouts() {
-        // Versioned subdir (user-local and system).
-        assert_eq!(
-            portable_root_from_path("/home/u/.local/share/powershell/7.6.2/pwsh").as_deref(),
-            Some("/home/u/.local/share/powershell")
-        );
-        assert_eq!(
-            portable_root_from_path("/opt/microsoft/powershell/7/pwsh").as_deref(),
-            Some("/opt/microsoft/powershell")
-        );
-        // Binary directly inside a `powershell` dir.
-        assert_eq!(
-            portable_root_from_path("/home/u/powershell/pwsh").as_deref(),
-            Some("/home/u/powershell")
-        );
-        // Unrelated locations stay undetermined — never guess.
-        assert!(portable_root_from_path("/usr/bin/pwsh").is_none());
-        assert!(portable_root_from_path("/home/u/.dotnet/tools/pwsh").is_none());
-        assert!(portable_root_from_path("pwsh").is_none());
-    }
+    // Portable-layout path recognition is a pure rule shared with the
+    // portable-replace adapter; its unit tests live in `core::portable`.
 
     #[test]
     fn macos_homebrew_ownership_signal_built() {
