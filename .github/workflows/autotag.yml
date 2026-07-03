@@ -1,0 +1,75 @@
+name: autotag
+
+# Cut a release automatically when a version bump lands on main: if Cargo.toml
+# says a version that has no v<version> tag yet, create and push that tag. The
+# tag push then triggers release.yml exactly as a manual `git push origin vX.Y.Z`
+# would.
+#
+# The tag is pushed over SSH with RELEASE_TAG_DEPLOY_KEY — a write-enabled
+# deploy key scoped to ONLY this repo — because tags pushed with the default
+# GITHUB_TOKEN do not trigger other workflows (GitHub suppresses recursive
+# workflow runs), so release.yml would never fire. Only pushes to main by
+# maintainers reach this job; fork PRs cannot trigger it, so the key is never
+# exposed to fork PRs.
+
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.toml']
+  # Manual retry if a tag push ever fails (e.g. the run raced a force-push).
+  workflow_dispatch:
+
+# Least privilege: the push happens via the deploy key, not GITHUB_TOKEN.
+permissions:
+  contents: read
+
+concurrency:
+  group: autotag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    env:
+      TAG_DEPLOY_KEY: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Determine tag
+        id: version
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $v"
+
+      - name: Check whether tag exists
+        id: exists
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "Tag $tag already exists; nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push tag
+        if: ${{ steps.exists.outputs.exists == 'false' }}
+        run: |
+          if [ -z "$TAG_DEPLOY_KEY" ]; then
+            echo "::error::Tag ${{ steps.version.outputs.tag }} is needed but the" \
+              "RELEASE_TAG_DEPLOY_KEY secret is not configured. Add a write-enabled" \
+              "deploy key for this repo, or push the tag manually."
+            exit 1
+          fi
+          tag="${{ steps.version.outputs.tag }}"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$TAG_DEPLOY_KEY" > ~/.ssh/tag_key
+          chmod 600 ~/.ssh/tag_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tag_key -o IdentitiesOnly=yes"
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+          rm -f ~/.ssh/tag_key
+          echo "Pushed $tag -> release workflow will start."
