@@ -180,6 +180,47 @@ pub fn replace_portable(
     Ok(())
 }
 
+/// Delete a portable tar.gz install (ADR-0007).
+///
+/// Resolves the installed pwsh binary and applies the same layout gate as
+/// [`replace_portable`] — only a directory that detection also classifies as a
+/// portable install is ever deleted, never an arbitrary one. Removes the
+/// install dir; in the versioned layout (`.../powershell/<version>/`) it then
+/// best-effort removes the `powershell/` root with a NON-recursive delete, so
+/// the root only goes away when it is empty (a sibling version dir keeps it).
+///
+/// Returns the removed install dir (the host prints the symlink-cleanup note
+/// against it). Progress lines go to `out`; errors are returned, not printed.
+pub fn remove_portable(
+    runner: &dyn CommandRunner,
+    out: &mut dyn Write,
+) -> Result<String, PortableError> {
+    let binary = runner
+        .resolve_program_path(probe::pwsh_exe())
+        .ok_or(PortableError::BinaryNotFound)?;
+    let install_dir = rules::install_dir_from_binary(&binary).ok_or_else(|| {
+        PortableError::NotPortableLayout {
+            binary: binary.clone(),
+        }
+    })?;
+    let root =
+        rules::install_root_from_path(&binary).ok_or_else(|| PortableError::NotPortableLayout {
+            binary: binary.clone(),
+        })?;
+
+    let _ = writeln!(out, "Removing {install_dir} ...");
+    std::fs::remove_dir_all(&install_dir)
+        .map_err(|e| fs_err(&install_dir, "removing the portable install directory", &e))?;
+
+    // Versioned layout: clean up the now-empty `powershell/` root. Non-recursive
+    // by design — if the root still holds anything (another version), it stays.
+    if root != install_dir {
+        let _ = std::fs::remove_dir(&root);
+    }
+
+    Ok(install_dir)
+}
+
 /// A sibling path of `dir` (same parent, so renames stay on one filesystem).
 fn sibling(dir: &Path, suffix: &str) -> PathBuf {
     let mut name = dir
@@ -653,6 +694,105 @@ mod tests {
         let mut out = Vec::new();
         let err = replace_portable(&http, &runner, &v("7.6.3"), &mut out).unwrap_err();
         assert_eq!(err, PortableError::BinaryNotFound);
+    }
+
+    // --- remove_portable (ADR-0007) -------------------------------------------
+
+    #[test]
+    fn remove_portable_deletes_versioned_dir_and_empty_root() {
+        let (_td, install, binary) = portable_install("old-binary");
+        let root = install.parent().unwrap().to_path_buf();
+        let runner = FakeRunner {
+            resolved: Some(binary),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let removed = remove_portable(&runner, &mut out).unwrap();
+        assert_eq!(removed, install.to_string_lossy());
+        assert!(!install.exists());
+        // The now-empty `powershell/` root is cleaned up too.
+        assert!(!root.exists());
+        assert!(String::from_utf8(out).unwrap().contains("Removing"));
+    }
+
+    #[test]
+    fn remove_portable_keeps_root_holding_a_sibling_version() {
+        let (_td, install, binary) = portable_install("old-binary");
+        let root = install.parent().unwrap().to_path_buf();
+        let sibling = root.join("7.5.0");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let runner = FakeRunner {
+            resolved: Some(binary),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        remove_portable(&runner, &mut out).unwrap();
+        assert!(!install.exists());
+        // The root still holds another version; the non-recursive cleanup
+        // must leave it (and the sibling) in place.
+        assert!(root.exists());
+        assert!(sibling.exists());
+    }
+
+    #[test]
+    fn remove_portable_handles_flat_layout_a() {
+        // Layout A: <...>/powershell/pwsh — the install dir IS the root.
+        let td = tempfile::tempdir().unwrap();
+        let install = td.path().join("powershell");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join("pwsh"), "x").unwrap();
+        let runner = FakeRunner {
+            resolved: Some(install.join("pwsh").to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        remove_portable(&runner, &mut out).unwrap();
+        assert!(!install.exists());
+        assert!(td.path().exists(), "only the recognized tree is deleted");
+    }
+
+    #[test]
+    fn remove_portable_refuses_non_portable_layout_and_deletes_nothing() {
+        let td = tempfile::tempdir().unwrap();
+        let bin = td.path().join("usr-bin").join("pwsh");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "x").unwrap();
+        let runner = FakeRunner {
+            resolved: Some(bin.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let err = remove_portable(&runner, &mut out).unwrap_err();
+        assert!(matches!(err, PortableError::NotPortableLayout { .. }));
+        assert!(bin.exists(), "nothing may be deleted on refusal");
+    }
+
+    #[test]
+    fn remove_portable_unresolvable_binary_is_an_honest_error() {
+        let runner = FakeRunner::default(); // resolves to None
+        let mut out = Vec::new();
+        let err = remove_portable(&runner, &mut out).unwrap_err();
+        assert_eq!(err, PortableError::BinaryNotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_portable_maps_permission_failure_to_elevation_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_td, install, binary) = portable_install("old-binary");
+        let root = install.parent().unwrap();
+        // Read+execute only: entries under root cannot be unlinked.
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let runner = FakeRunner {
+            resolved: Some(binary),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let err = remove_portable(&runner, &mut out).unwrap_err();
+        // Restore write access so the tempdir guard can clean up.
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(err, PortableError::PermissionDenied { .. }));
+        assert!(install.exists());
     }
 
     // --- extract_hardened ----------------------------------------------------

@@ -9,3 +9,5 @@ Product-local ADR log (ADR-0015 separation: product decisions only; factory ADRs
 | 0003 | Prerelease handling policy — stable-only by default | Accepted | [0003-prerelease-handling-stable-only.md](0003-prerelease-handling-stable-only.md) |
 | 0004 | Multiple-install-method resolution precedence | Accepted | [0004-multiple-install-method-resolution.md](0004-multiple-install-method-resolution.md) |
 | 0005 | Technology stack & dependencies | Accepted | [0005-technology-stack-and-dependencies.md](0005-technology-stack-and-dependencies.md) |
+| 0006 | Install PowerShell when missing (supersedes 0001) | Accepted | [0006-install-when-missing.md](0006-install-when-missing.md) |
+| 0007 | Uninstall via the owning channel (`--uninstall`) | Accepted | [0007-uninstall-via-owning-channel.md](0007-uninstall-via-owning-channel.md) |

@@ -50,11 +50,11 @@ pub enum DetectError {
     NotInstalled,
 }
 
-/// Failure building an update plan for the selected method.
+/// Failure building an update or uninstall plan for the selected method.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PlanError {
-    /// The (method, OS) pair has no defined upgrade procedure.
-    #[error("no update plan for method {method} on {os}")]
+    /// The (method, OS) pair has no defined procedure.
+    #[error("no plan for method {method} on {os}")]
     UnsupportedCombination { method: String, os: String },
 }
 
@@ -105,7 +105,7 @@ pub enum PortableError {
 
     /// The install directory is not writable by this process. FR-12: surface
     /// the requirement; never self-elevate.
-    #[error("replacing the portable install at {dir} requires write access ({reason}). Re-run with elevation (e.g. sudo); this tool will not self-elevate")]
+    #[error("modifying the portable install at {dir} requires write access ({reason}). Re-run with elevation (e.g. sudo); this tool will not self-elevate")]
     PermissionDenied { dir: String, reason: String },
 
     /// A filesystem step failed for a non-permission reason.
@@ -192,10 +192,7 @@ mod tests {
             method: "Homebrew".to_string(),
             os: "Windows".to_string(),
         };
-        assert_eq!(
-            err.to_string(),
-            "no update plan for method Homebrew on Windows"
-        );
+        assert_eq!(err.to_string(), "no plan for method Homebrew on Windows");
     }
 
     #[test]
@@ -212,6 +209,6 @@ mod tests {
             os: "Macos".to_string(),
         }
         .into();
-        assert_eq!(p.to_string(), "no update plan for method Snap on Macos");
+        assert_eq!(p.to_string(), "no plan for method Snap on Macos");
     }
 }

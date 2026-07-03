@@ -64,6 +64,12 @@ the OS. A package manager above avoids this; for a direct download:
 5. Either reports what it would do (`--check`) or performs the upgrade through
    the detected channel (default).
 
+With `--uninstall` it removes PowerShell through the same owning channel
+instead. Uninstalling is destructive, so it first shows the exact command and
+asks for confirmation (`Proceed with the uninstall? [y/N]`, defaulting to No);
+pass `--yes` to skip the prompt. When stdin is not a terminal (pipes, CI),
+`--yes` is required — piped input is never treated as consent.
+
 If PowerShell is **not installed**, the tool installs it from scratch via the
 OS's native package manager — winget (then Chocolatey) on Windows, Homebrew on
 macOS, snap on Linux — and `--check` reports the install command it would run.
@@ -144,11 +150,46 @@ self-elevates). The SHA-256 manifest ships from the same GitHub release as the
 tarball, so the check guards integrity in transit — the trust root is TLS to
 `github.com`, the same as any package manager installing from GitHub releases.
 
+Uninstall PowerShell through its owning channel (ADR-0007):
+
+```sh
+pwsh-autoupdate --uninstall        # shows the command, asks "Proceed? [y/N]"
+pwsh-autoupdate --uninstall --yes  # no prompt (required when stdin is not a terminal)
+```
+
+The command shown at the prompt and the executed command are always identical.
+Per channel the uninstall runs:
+
+| OS | Channel | Uninstall command |
+|----|---------|-------------------|
+| Windows | winget | `winget uninstall --id Microsoft.PowerShell --silent --accept-source-agreements` |
+| Windows | MSIX / Microsoft Store | the same, via `--source msstore` |
+| Windows | MSI | the winget command above (elevated) |
+| Windows | Chocolatey | `choco uninstall powershell-core -y` |
+| macOS | Homebrew | `brew uninstall powershell` |
+| macOS | direct `.pkg` | `rm -rf /usr/local/microsoft/powershell /usr/local/bin/pwsh` (Microsoft's documented removal; elevated) then `pkgutil --forget com.microsoft.powershell` |
+| Linux | apt/dpkg | `apt-get remove -y powershell` (`remove`, not `purge` — config under `/etc` is kept) |
+| Linux | dnf/rpm | `dnf remove -y powershell` |
+| Linux | snap | `snap remove powershell` |
+| Linux | portable `tar.gz` | deletes the recognized portable install directory (in-process) |
+
+It uninstalls only via the single owning channel; also-detected channels are
+reported, never touched. For a portable install, only the layout-recognized
+install directory is deleted (in the versioned layout the now-empty
+`powershell/` parent is cleaned up too, but never while it holds another
+version); `PATH` entries and symlinks such as `~/.local/bin/pwsh` are left for
+you to remove, and the tool says so. If `pwsh` is not installed, `--uninstall`
+is an idempotent success ("nothing to uninstall"). As everywhere else, it never
+self-elevates and never reports success when the removal did not actually
+happen (it re-checks that `pwsh` is gone rather than trusting the manager's
+exit code).
+
 There are no other flags. `--check` is read-only: it executes no
 package-manager process and performs no state-changing or network-write side
 effect. It prints the current installed version, the detected install method
 (plus any also-detected channels), the latest available stable version, and the
-exact command it would run to update.
+exact command it would run to update. `--uninstall` performs no network read at
+all, and removes nothing unless you confirm at the prompt (or passed `--yes`).
 
 Sample `--check` output:
 
@@ -158,6 +199,17 @@ Detected method: Homebrew (also detected: macOS .pkg)
 Latest version:  7.5.0
 Status:          update available
 Would run: brew upgrade powershell
+```
+
+Sample `--uninstall` prompt (answering `n` or just Enter aborts):
+
+```
+Current version: 7.4.0
+Detected method: apt/dpkg
+Would run:       apt-get remove -y powershell
+                 (requires elevation)
+Proceed with the uninstall? [y/N] n
+Aborted. PowerShell was NOT uninstalled.
 ```
 
 ## Exit codes
@@ -178,6 +230,13 @@ Default (full-run, mutating) mode:
 |------|---------|
 | 0 | success, including the up-to-date no-op |
 | non-zero | failure |
+
+`--uninstall`:
+
+| Code | Meaning |
+|------|---------|
+| 0 | uninstalled (confirmed at the prompt or via `--yes`), or nothing to uninstall |
+| 1 | aborted at the prompt, `--yes` required but absent (stdin not a terminal), method undetermined, or the removal failed |
 
 Example: branch on whether an update is available, using exit status alone:
 

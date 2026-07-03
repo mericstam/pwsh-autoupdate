@@ -38,6 +38,20 @@ fn main() -> ExitCode {
         app::run_check(&http, &runner, os, &mut stdout, &mut stderr)
     } else if cli.replace_portable {
         app::run_replace_portable(&http, &runner, os, &mut stdout, &mut stderr)
+    } else if cli.uninstall {
+        // No HTTP: removing PowerShell never needs the latest version. The
+        // interactive confirmation source is stdin ONLY when it is a real
+        // terminal — piped stdin must never be consumed as consent.
+        use std::io::IsTerminal;
+        let stdin = std::io::stdin();
+        let mut lock;
+        let input: Option<&mut dyn std::io::BufRead> = if stdin.is_terminal() {
+            lock = stdin.lock();
+            Some(&mut lock)
+        } else {
+            None
+        };
+        app::run_uninstall(&runner, os, cli.yes, input, &mut stdout, &mut stderr)
     } else {
         app::run_update(&http, &runner, os, &mut stdout, &mut stderr)
     };

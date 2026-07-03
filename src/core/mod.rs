@@ -122,6 +122,23 @@ pub struct InstallPlan {
     pub requires_elevation: bool,
 }
 
+/// The uninstall plan (ADR-0007): the owning-channel command that removes
+/// PowerShell. Mirrors [`UpdatePlan`]'s command shape (FR-9 agreement: the
+/// previewed command equals the executed one); carries no versions because an
+/// uninstall needs none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninstallPlan {
+    pub method: InstallMethod,
+    pub program: String,
+    pub args: Vec<String>,
+    /// FR-12: the host surfaces this before execution; the tool never
+    /// self-elevates.
+    pub requires_elevation: bool,
+    /// Best-effort follow-ups run only after the primary command succeeds
+    /// (macOS .pkg populates this with `pkgutil --forget` receipt cleanup).
+    pub post_steps: Vec<PlanCommand>,
+}
+
 /// A single `program args...` invocation. Used for a plan's optional follow-up
 /// steps that must run *after* the primary upgrade command succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
