@@ -13,7 +13,7 @@
 //! `cfg(target_os = ...)` so each OS only runs its own managers.
 
 use crate::adapters::runner::CommandRunner;
-use crate::core::{DetectionSignals, InstallMethod, Os};
+use crate::core::{detect, DetectionSignals, InstallMethod, Os};
 
 /// The PowerShell executable name for the current platform.
 ///
@@ -133,19 +133,89 @@ fn manager_lists_pwsh(runner: &dyn CommandRunner, program: &str, args: &[&str]) 
     }
 }
 
+/// Read-only Windows PowerShell 5.1 query (present on every supported Windows)
+/// reporting the install technologies registered for PowerShell 7:
+/// * `MSI <product-code>` per MSI uninstall registration (`WindowsInstaller=1`,
+///   stable channel only — previews are a separate product);
+/// * `MSIX <package-full-name>` per registered `Microsoft.PowerShell` AppX.
+///
+/// Uses only single quotes so it survives Windows argv quoting unchanged.
+pub(crate) const WINDOWS_INSTALL_QUERY: &str = "$ErrorActionPreference='SilentlyContinue'; \
+Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' \
+| Where-Object { $_.DisplayName -like 'PowerShell 7*' -and $_.DisplayName -notlike '*preview*' -and $_.WindowsInstaller -eq 1 } \
+| ForEach-Object { 'MSI ' + $_.PSChildName }; \
+Get-AppxPackage -Name 'Microsoft.PowerShell' | ForEach-Object { 'MSIX ' + $_.PackageFullName }";
+
 fn gather_windows(runner: &dyn CommandRunner, signals: &mut DetectionSignals) {
-    if note_manager(runner, "winget", InstallMethod::Winget, signals) {
+    let winget = note_manager(runner, "winget", InstallMethod::Winget, signals);
+    if winget {
+        // Weak signal: winget correlates ANY installed PowerShell with this id.
         signals.winget_lists_pwsh =
             manager_lists_pwsh(runner, "winget", &["list", "--id", "Microsoft.PowerShell"]);
     }
-    // MSIX / MSI registration are read via PowerShell/registry queries; modelled
-    // here as ownership queries that the host can refine. Default false until a
-    // positive signal is seen.
+
+    // The install TECHNOLOGY of the pwsh actually on PATH decides the channel.
+    if signals.pwsh_present {
+        let query = runner
+            .run(
+                "powershell.exe",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    WINDOWS_INSTALL_QUERY,
+                ],
+            )
+            .ok()
+            .filter(|out| out.status == 0)
+            .map(|out| detect::parse_windows_install_query(&out.stdout))
+            .unwrap_or_default();
+
+        // The resolved binary path is decisive when known: an MSIX package (or
+        // its App Execution Alias) lives under `WindowsApps`. Without a path,
+        // fall back to the AppX registration.
+        let on_path_is_msix = match runner.resolve_program_path(pwsh_exe()) {
+            Some(path) => detect::is_windowsapps_path(&path),
+            None => query.appx_registered,
+        };
+        signals.msix_registered = on_path_is_msix;
+        signals.msi_registered = !on_path_is_msix && query.msi_product_code.is_some();
+        signals.msi_product_code = query.msi_product_code.filter(|_| signals.msi_registered);
+
+        // For an MSI install, learn which technology winget's latest package
+        // uses: 7.7.0+ is MSIX-only, which winget cannot upgrade an MSI to.
+        if signals.msi_registered && winget {
+            signals.winget_installer_type = runner
+                .run(
+                    "winget",
+                    &[
+                        "show",
+                        "--id",
+                        "Microsoft.PowerShell",
+                        "--exact",
+                        "--source",
+                        "winget",
+                        "--accept-source-agreements",
+                    ],
+                )
+                .ok()
+                .filter(|out| out.status == 0)
+                .and_then(|out| detect::parse_winget_installer_type(&out.stdout));
+        }
+    }
+
     if note_manager(runner, "choco", InstallMethod::Chocolatey, signals) {
+        // Chocolatey v1 needs `--local-only`; v2 removed that flag (it errors)
+        // and lists local packages by default. `--limit-output` keeps v2 from
+        // echoing anything when the package is absent.
         signals.choco_lists_pwsh = manager_lists_pwsh(
             runner,
             "choco",
             &["list", "--local-only", "powershell-core"],
+        ) || manager_lists_pwsh(
+            runner,
+            "choco",
+            &["list", "powershell-core", "--exact", "--limit-output"],
         );
     }
 }
@@ -365,6 +435,73 @@ mod tests {
         let s = probe(&runner, Os::Windows);
         assert!(s.winget_lists_pwsh);
         assert!(s.available_managers.contains(&InstallMethod::Winget));
+    }
+
+    #[test]
+    fn windows_msi_install_listed_by_winget_is_detected_as_msi() {
+        // Regression (0x8A15008E): an MSI-installed pwsh that winget lists, and
+        // whose latest winget installer is MSIX, must resolve to Msi with the
+        // product code + installer type captured — not to Winget.
+        let exe = pwsh_exe();
+        let runner = FakeRunner::default()
+            .output(exe, 0, "PowerShell 7.6.9")
+            .output("powershell.exe", 0, "MSI {5417B253-1A6D-4638-BC94-743A6EC2E6F4}\r\n")
+            .output(
+                "winget",
+                0,
+                "PowerShell 7.6.9.0-x64 Microsoft.PowerShell 7.6.9.0 7.7.0.0 winget\n  Installer Type: msix\n",
+            )
+            .resolved_path(r"\\?\C:\Program Files\PowerShell\7\pwsh.exe");
+        let s = probe(&runner, Os::Windows);
+        assert!(s.winget_lists_pwsh);
+        assert!(s.msi_registered);
+        assert!(!s.msix_registered);
+        assert_eq!(
+            s.msi_product_code.as_deref(),
+            Some("{5417B253-1A6D-4638-BC94-743A6EC2E6F4}")
+        );
+        assert_eq!(s.winget_installer_type.as_deref(), Some("msix"));
+        let d = crate::core::detect::resolve(Os::Windows, &s);
+        assert_eq!(d.selected, Some(InstallMethod::Msi));
+        assert!(crate::core::detect::msi_needs_msix_migration(
+            d.selected, &s
+        ));
+    }
+
+    #[test]
+    fn windows_pwsh_under_windowsapps_is_msix_even_with_stale_msi_entry() {
+        let exe = pwsh_exe();
+        let runner = FakeRunner::default()
+            .output(exe, 0, "PowerShell 7.7.0")
+            .output(
+                "powershell.exe",
+                0,
+                "MSI {5417B253-1A6D-4638-BC94-743A6EC2E6F4}\nMSIX Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\n",
+            )
+            .resolved_path(
+                r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\pwsh.exe",
+            );
+        let s = probe(&runner, Os::Windows);
+        assert!(s.msix_registered);
+        assert!(!s.msi_registered);
+        assert!(s.msi_product_code.is_none());
+        let d = crate::core::detect::resolve(Os::Windows, &s);
+        assert_eq!(d.selected, Some(InstallMethod::Msix));
+    }
+
+    #[test]
+    fn windows_unresolvable_path_falls_back_to_appx_registration() {
+        let exe = pwsh_exe();
+        let runner = FakeRunner::default()
+            .output(exe, 0, "PowerShell 7.7.0")
+            .output(
+                "powershell.exe",
+                0,
+                "MSIX Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\n",
+            );
+        let s = probe(&runner, Os::Windows);
+        assert!(s.msix_registered);
+        assert!(!s.msi_registered);
     }
 
     #[test]

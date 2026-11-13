@@ -150,6 +150,22 @@ self-elevates). The SHA-256 manifest ships from the same GitHub release as the
 tarball, so the check guards integrity in transit — the trust root is TLS to
 `github.com`, the same as any package manager installing from GitHub releases.
 
+**Windows MSI installs and PowerShell 7.7+.** PowerShell 7.7.0 is published
+only as MSIX (no MSI), and winget refuses to upgrade an MSI install to MSIX in
+place. When the tool detects an MSI install whose next version is MSIX-only,
+`--check` shows the migration and the default update stops with an
+explanation. To switch to the MSIX package, close other PowerShell 7 windows
+and run, from an elevated shell:
+
+```sh
+pwsh-autoupdate --migrate
+```
+
+This removes the MSI (`msiexec /x {product-code} /qn /norestart`) and, only if
+that succeeded, installs the MSIX (`winget install --id Microsoft.PowerShell
+--exact --source winget ...`). If the second step fails, the tool says that
+PowerShell 7 is no longer installed and prints the command to install it.
+
 Uninstall PowerShell through its owning channel (ADR-0007):
 
 ```sh
@@ -163,7 +179,7 @@ Per channel the uninstall runs:
 | OS | Channel | Uninstall command |
 |----|---------|-------------------|
 | Windows | winget | `winget uninstall --id Microsoft.PowerShell --silent --accept-source-agreements` |
-| Windows | MSIX / Microsoft Store | the same, via `--source msstore` |
+| Windows | MSIX / Microsoft Store | the same winget command |
 | Windows | MSI | the winget command above (elevated) |
 | Windows | Chocolatey | `choco uninstall powershell-core -y` |
 | macOS | Homebrew | `brew uninstall powershell` |
@@ -184,7 +200,7 @@ self-elevates and never reports success when the removal did not actually
 happen (it re-checks that `pwsh` is gone rather than trusting the manager's
 exit code).
 
-There are no other flags. `--check` is read-only: it executes no
+There are no other flags (`--migrate` only modifies the default update path). `--check` is read-only: it executes no
 package-manager process and performs no state-changing or network-write side
 effect. It prints the current installed version, the detected install method
 (plus any also-detected channels), the latest available stable version, and the

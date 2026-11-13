@@ -11,7 +11,9 @@
 //! not here — core only fixes the program/args shape.
 
 use crate::core::error::PlanError;
-use crate::core::{InstallMethod, InstallPlan, Os, PlanCommand, UninstallPlan, UpdatePlan};
+use crate::core::{
+    InstallMethod, InstallPlan, MigrationPlan, Os, PlanCommand, UninstallPlan, UpdatePlan,
+};
 use semver::Version;
 
 /// Resolve the NATIVE from-scratch install command for `os`, given which manager
@@ -120,7 +122,7 @@ pub fn build_plan(
                 "--id",
                 "Microsoft.PowerShell",
                 "--source",
-                "msstore",
+                "winget",
                 "--silent",
                 "--accept-source-agreements",
                 "--accept-package-agreements",
@@ -213,6 +215,48 @@ pub fn build_plan(
     })
 }
 
+/// Build the MSI -> MSIX migration plan (opt-in `--migrate`).
+///
+/// Step 1 removes the MSI by its registered product code; step 2 installs the
+/// winget-source `Microsoft.PowerShell` package, which is MSIX from 7.7.0 on.
+/// The product code is re-validated here (it is passed to `msiexec`), so a
+/// malformed value can never reach the command line.
+pub fn build_msi_to_msix_migration(
+    msi_product_code: &str,
+    from: Version,
+    to: Version,
+) -> Result<MigrationPlan, PlanError> {
+    if !crate::core::detect::is_msi_product_code(msi_product_code) {
+        return Err(PlanError::InvalidMsiProductCode {
+            code: msi_product_code.to_string(),
+        });
+    }
+    let cmd = |program: &str, args: &[&str]| PlanCommand {
+        program: program.to_string(),
+        args: args.iter().map(|s| s.to_string()).collect(),
+    };
+    Ok(MigrationPlan {
+        from,
+        to,
+        uninstall: cmd("msiexec", &["/x", msi_product_code, "/qn", "/norestart"]),
+        install: cmd(
+            "winget",
+            &[
+                "install",
+                "--id",
+                "Microsoft.PowerShell",
+                "--exact",
+                "--source",
+                "winget",
+                "--silent",
+                "--accept-source-agreements",
+                "--accept-package-agreements",
+            ],
+        ),
+        requires_elevation: true,
+    })
+}
+
 /// Build the uninstall plan for the selected method on the given OS (ADR-0007).
 ///
 /// The same command table discipline as [`build_plan`]: the exact `program` +
@@ -243,8 +287,6 @@ pub fn build_uninstall_plan(method: InstallMethod, os: Os) -> Result<UninstallPl
                 "uninstall",
                 "--id",
                 "Microsoft.PowerShell",
-                "--source",
-                "msstore",
                 "--silent",
                 "--accept-source-agreements",
             ],
@@ -414,10 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn msix_plan_routes_through_msstore() {
+    fn msix_plan_routes_through_winget_source_not_msstore() {
+        // The winget-source Microsoft.PowerShell package IS the MSIX since
+        // 7.7.0; the msstore source has no package with that id.
         let p = plan(InstallMethod::Msix, Os::Windows);
         assert_eq!(p.program, "winget");
-        assert!(p.args.iter().any(|a| a == "msstore"));
+        assert!(p.args.windows(2).any(|w| w == ["--source", "winget"]));
+        assert!(!p.args.iter().any(|a| a == "msstore"));
         assert!(!p.requires_elevation);
     }
 
@@ -526,6 +571,7 @@ mod tests {
                 assert_eq!(method, "Winget");
                 assert_eq!(os, "Linux");
             }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 
@@ -553,11 +599,46 @@ mod tests {
     }
 
     #[test]
-    fn msix_uninstall_plan_routes_through_msstore() {
+    fn msix_uninstall_plan_does_not_use_msstore() {
         let p = uplan(InstallMethod::Msix, Os::Windows);
         assert_eq!(p.program, "winget");
-        assert!(p.args.iter().any(|a| a == "msstore"));
+        assert!(!p.args.iter().any(|a| a == "msstore"));
         assert!(!p.requires_elevation);
+    }
+
+    // --- MSI -> MSIX migration ------------------------------------------------
+
+    const CODE: &str = "{5417B253-1A6D-4638-BC94-743A6EC2E6F4}";
+
+    #[test]
+    fn msi_migration_removes_msi_then_installs_msix() {
+        let m = build_msi_to_msix_migration(CODE, v("7.6.9"), v("7.7.0")).unwrap();
+        assert_eq!(m.uninstall.program, "msiexec");
+        assert_eq!(m.uninstall.args, vec!["/x", CODE, "/qn", "/norestart"]);
+        assert_eq!(m.install.program, "winget");
+        assert_eq!(
+            m.install.args,
+            vec![
+                "install",
+                "--id",
+                "Microsoft.PowerShell",
+                "--exact",
+                "--source",
+                "winget",
+                "--silent",
+                "--accept-source-agreements",
+                "--accept-package-agreements"
+            ]
+        );
+        assert!(m.requires_elevation);
+        assert_eq!(m.from, v("7.6.9"));
+        assert_eq!(m.to, v("7.7.0"));
+    }
+
+    #[test]
+    fn msi_migration_rejects_malformed_product_code() {
+        assert!(build_msi_to_msix_migration("{nope}", v("7.6.9"), v("7.7.0")).is_err());
+        assert!(build_msi_to_msix_migration("", v("7.6.9"), v("7.7.0")).is_err());
     }
 
     #[test]
@@ -682,6 +763,7 @@ mod tests {
                 assert_eq!(method, "Homebrew");
                 assert_eq!(os, "Windows");
             }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 }

@@ -18,7 +18,8 @@ use crate::core::error::CoreError;
 use crate::core::{
     detect, plan,
     report::{CheckReport, UninstallReport},
-    version, Detection, InstallMethod, Os, ReleaseInfo, VersionState,
+    version, Detection, DetectionSignals, InstallMethod, MigrationPlan, Os, ReleaseInfo,
+    VersionState,
 };
 use std::io::{BufRead, Write};
 
@@ -129,6 +130,24 @@ pub fn run_check(
 
     let state = version::classify(&current, &latest.version);
 
+    // MSI install whose next version only exists as MSIX: no in-place upgrade
+    // exists; report the opt-in migration (exactly what `--migrate` runs).
+    if state == VersionState::UpdateAvailable
+        && detect::msi_needs_msix_migration(detection.selected, &signals)
+    {
+        let migration = match migration_plan(&signals, &current, &latest.version) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return EXIT_CHECK_ERROR;
+            }
+        };
+        let report = CheckReport::build(current, latest.version, state, detection, None)
+            .with_migration(migration);
+        let _ = writeln!(out, "{report}");
+        return EXIT_UPDATE_AVAILABLE;
+    }
+
     // Build the plan only when a method is determined AND an update is available
     // (and the (method, os) combination is supported). The same plan is what the
     // update path would execute (FR-9 agreement). A plan-build failure is an
@@ -169,24 +188,50 @@ fn plan_for(
     }
 }
 
+/// Build the MSI -> MSIX migration plan from probed signals. A missing product
+/// code is an honest error (the MSI cannot be removed without it).
+fn migration_plan(
+    signals: &DetectionSignals,
+    current: &semver::Version,
+    latest: &semver::Version,
+) -> Result<MigrationPlan, CoreError> {
+    let code = signals.msi_product_code.as_deref().unwrap_or_default();
+    Ok(plan::build_msi_to_msix_migration(
+        code,
+        current.clone(),
+        latest.clone(),
+    )?)
+}
+
 /// Best-effort check of whether the current process holds the elevated
 /// privileges a system-scope upgrade needs (FR-12). The tool NEVER self-elevates
 /// — it only reports the requirement when it is unmet.
 ///
-/// On Unix this is "are we root (euid 0)?". On Windows there is no portable
-/// libc check without extra crates; conservatively report `false` so the host
-/// surfaces the requirement rather than silently attempting a privileged action
-/// it may not be allowed to perform.
+/// On Unix this is "are we root (euid 0)?". On Windows it asks shell32's
+/// `IsUserAnAdmin`, which is true only for an elevated (UAC "Run as
+/// administrator") token — exactly what `msiexec /qn` / Chocolatey need.
 pub fn has_elevated_privileges() -> bool {
     #[cfg(unix)]
     {
         // SAFETY: `geteuid` is always safe to call and has no preconditions.
         unsafe { libc_geteuid() == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // SAFETY: `IsUserAnAdmin` takes no arguments and only reads the
+        // current process token.
+        unsafe { IsUserAnAdmin() != 0 }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
+}
+
+#[cfg(windows)]
+#[link(name = "shell32")]
+extern "system" {
+    fn IsUserAnAdmin() -> i32;
 }
 
 #[cfg(unix)]
@@ -204,10 +249,19 @@ pub fn run_update(
     http: &dyn HttpClient,
     runner: &dyn CommandRunner,
     os: Os,
+    migrate: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    run_update_with(http, runner, os, has_elevated_privileges(), out, err)
+    run_update_with(
+        http,
+        runner,
+        os,
+        has_elevated_privileges(),
+        migrate,
+        out,
+        err,
+    )
 }
 
 /// The update flow with the privilege state injected (testable).
@@ -220,6 +274,9 @@ pub fn run_update(
 ///    version (FR-11).
 /// 4. up-to-date → exit 0 (no-op).
 /// 5. method undetermined → report, exit non-zero, attempt no update.
+///    An MSI install whose next release is MSIX-only stops and explains, or
+///    with `migrate` removes the MSI and installs the MSIX
+///    ([`migrate_msi_to_msix`]).
 /// 6. build the plan (same plan as `--check`, FR-9).
 /// 7. `requires_elevation && !elevated` → surface the requirement, exit
 ///    non-zero, NEVER self-elevate (FR-12).
@@ -232,6 +289,7 @@ pub fn run_update_with(
     runner: &dyn CommandRunner,
     os: Os,
     elevated: bool,
+    migrate: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
@@ -292,6 +350,17 @@ pub fn run_update_with(
             return EXIT_FAILURE;
         }
     };
+
+    if detect::msi_needs_msix_migration(Some(method), &signals) {
+        let migration = match migration_plan(&signals, &current, &latest.version) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return EXIT_FAILURE;
+            }
+        };
+        return migrate_msi_to_msix(runner, &migration, elevated, migrate, out, err);
+    }
 
     let plan = match plan::build_plan(method, current.clone(), latest.version.clone(), os) {
         Ok(p) => p,
@@ -401,6 +470,12 @@ pub fn run_update_with(
             );
             if !output.stderr.trim().is_empty() {
                 let _ = writeln!(err, "{}", output.stderr.trim_end());
+            }
+            if plan.program == "winget" && output.status == WINGET_INSTALL_TECHNOLOGY_MISMATCH {
+                let _ = writeln!(
+                    err,
+                    "winget refused because the new version uses a different install technology (e.g. MSI -> MSIX) than the installed one. PowerShell was not updated; run `pwsh-autoupdate --check` to see the detected install method."
+                );
             }
             EXIT_FAILURE
         }
@@ -742,6 +817,137 @@ pub fn run_uninstall_with(
 /// target version before discarding the previous install (and rolls back
 /// otherwise), so an `Ok` here IS the verified outcome — success is never
 /// reported on a real failure (FR-6).
+/// winget `APPINSTALLER_CLI_ERROR_INSTALL_TECHNOLOGY_MISMATCH` (`0x8A15008E`):
+/// the available version uses a different installer technology than the
+/// installed one, so winget will not upgrade in place.
+const WINGET_INSTALL_TECHNOLOGY_MISMATCH: i32 = 0x8A15008E_u32 as i32;
+
+/// msiexec `ERROR_SUCCESS_REBOOT_REQUIRED`: removal succeeded, some files
+/// (e.g. a running pwsh.exe) are deleted at the next reboot.
+const MSI_SUCCESS_REBOOT_REQUIRED: i32 = 3010;
+
+/// The MSI -> MSIX switch (PowerShell 7.7.0+ ships no MSI).
+///
+/// Without `migrate` it only explains (what changed, the exact commands) and
+/// exits non-zero — replacing the install technology is never done implicitly.
+/// With `migrate` it requires elevation (FR-12; `msiexec /qn` cannot prompt),
+/// removes the MSI, and only if that succeeded installs the MSIX package.
+fn migrate_msi_to_msix(
+    runner: &dyn CommandRunner,
+    m: &MigrationPlan,
+    elevated: bool,
+    migrate: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let uninstall_cmd = render_command(&m.uninstall.program, &m.uninstall.args);
+    let install_cmd = render_command(&m.install.program, &m.install.args);
+
+    if !migrate {
+        let _ = writeln!(
+            err,
+            "error: PowerShell {} was installed with the MSI installer, but PowerShell {} is only published as MSIX \
+(the MSI was discontinued). winget cannot upgrade an MSI install to MSIX in place.\n\
+To switch this machine to the MSIX package, close other PowerShell 7 windows and re-run from an elevated shell:\n  pwsh-autoupdate --migrate\n\
+which runs:\n  {uninstall_cmd}\n  {install_cmd}",
+            m.from, m.to
+        );
+        return EXIT_FAILURE;
+    }
+
+    if m.requires_elevation && !elevated {
+        let _ = writeln!(
+            err,
+            "error: migrating PowerShell from MSI to MSIX requires elevated privileges (removing the MSI). Re-run `pwsh-autoupdate --migrate` from an elevated shell; this tool will not self-elevate."
+        );
+        return EXIT_FAILURE;
+    }
+
+    for program in [&m.uninstall.program, &m.install.program] {
+        if !runner.exists(program) {
+            let _ = writeln!(
+                err,
+                "error: '{program}' was not found on PATH; cannot migrate PowerShell from MSI to MSIX. Nothing was changed."
+            );
+            return EXIT_FAILURE;
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "Migrating PowerShell {} (MSI) -> {} (MSIX) ...",
+        m.from, m.to
+    );
+
+    // Step 1: remove the MSI. On failure Windows Installer rolls back, so the
+    // existing install is intact.
+    let _ = writeln!(out, "Running: {uninstall_cmd}");
+    let args: Vec<&str> = m.uninstall.args.iter().map(String::as_str).collect();
+    let mut reboot_needed = false;
+    match runner.run(&m.uninstall.program, &args) {
+        Ok(o) if o.status == 0 => {}
+        Ok(o) if o.status == MSI_SUCCESS_REBOOT_REQUIRED => reboot_needed = true,
+        Ok(o) => {
+            let _ = writeln!(
+                err,
+                "error: removing the PowerShell MSI failed ('{}' exited with status {}). PowerShell {} was left installed; nothing else was changed.",
+                m.uninstall.program, o.status, m.from
+            );
+            if !o.stderr.trim().is_empty() {
+                let _ = writeln!(err, "{}", o.stderr.trim_end());
+            }
+            return EXIT_FAILURE;
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "error: failed to run '{}': {e}. Nothing was changed.",
+                m.uninstall.program
+            );
+            return EXIT_FAILURE;
+        }
+    }
+
+    // Step 2: install the MSIX. If this fails PowerShell 7 is now absent —
+    // say so loudly and give the exact recovery command.
+    let _ = writeln!(out, "Running: {install_cmd}");
+    let args: Vec<&str> = m.install.args.iter().map(String::as_str).collect();
+    let failure = match runner.run(&m.install.program, &args) {
+        Ok(o) if o.status == 0 => None,
+        Ok(o) => Some(format!(
+            "'{}' exited with status {}{}",
+            m.install.program,
+            o.status,
+            if o.stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", o.stderr.trim_end())
+            }
+        )),
+        Err(e) => Some(format!("failed to run '{}': {e}", m.install.program)),
+    };
+    if let Some(reason) = failure {
+        let _ = writeln!(
+            err,
+            "error: the MSI was removed, but installing the MSIX package failed ({reason}). PowerShell 7 is currently NOT installed. Install it with:\n  {install_cmd}"
+        );
+        return EXIT_FAILURE;
+    }
+
+    let _ = writeln!(
+        out,
+        "PowerShell migrated to the MSIX package ({}). Open a new terminal so `pwsh` resolves to it.",
+        m.to
+    );
+    if reboot_needed {
+        let _ = writeln!(
+            out,
+            "Note: Windows Installer reported that a reboot is needed to finish removing the old MSI files."
+        );
+    }
+    EXIT_SUCCESS
+}
+
 fn portable_update(
     http: &dyn HttpClient,
     runner: &dyn CommandRunner,
@@ -1001,6 +1207,7 @@ mod tests {
                 || *a == "install"
                 || *a == "uninstall"
                 || *a == "remove"
+                || *a == "/x"
                 || *a == "-rf"
         })
     }
@@ -1139,6 +1346,8 @@ mod tests {
                 let is_pwsh_version = p == exe && args == &vec!["--version".to_string()];
                 let is_list_query = args.iter().any(|a| {
                     a == "list"
+                        || a == "show"
+                        || a == "-NonInteractive"
                         || a == "-s"
                         || a == "-q"
                         || a.starts_with("--pkgs")
@@ -1286,7 +1495,7 @@ mod tests {
         let runner = FakeRunner::pwsh("PowerShell 7.4.0").with_manager("brew", "powershell");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Macos, false, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Macos, false, false, &mut out, &mut err);
         let stdout = String::from_utf8(out).unwrap();
         assert_eq!(code, EXIT_SUCCESS);
         assert!(stdout.contains("updated successfully"));
@@ -1322,7 +1531,7 @@ mod tests {
             .fail_post_step(1, "Error: Could not symlink bin/pwsh");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Macos, false, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Macos, false, false, &mut out, &mut err);
         let stdout = String::from_utf8(out).unwrap();
         let stderr = String::from_utf8(err).unwrap();
         assert_eq!(code, EXIT_SUCCESS);
@@ -1338,7 +1547,7 @@ mod tests {
         let runner = FakeRunner::pwsh("PowerShell 7.4.0").with_manager("brew", "powershell");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Macos, false, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Macos, false, false, &mut out, &mut err);
         assert_eq!(code, EXIT_SUCCESS);
         assert!(String::from_utf8(out).unwrap().contains("up to date"));
         assert!(mutating_runs(&runner).is_empty());
@@ -1352,7 +1561,7 @@ mod tests {
             .fail_upgrade(1, "brew: upgrade failed: locked");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Macos, false, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Macos, false, false, &mut out, &mut err);
         let stdout = String::from_utf8(out).unwrap();
         let stderr = String::from_utf8(err).unwrap();
         assert_ne!(code, EXIT_SUCCESS);
@@ -1374,7 +1583,7 @@ mod tests {
             .upgrades_to("PowerShell 7.6.3");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Windows, true, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Windows, true, false, &mut out, &mut err);
         let stdout = String::from_utf8(out).unwrap();
         let stderr = String::from_utf8(err).unwrap();
         assert_eq!(code, EXIT_SUCCESS);
@@ -1383,6 +1592,124 @@ mod tests {
         assert!(!stderr.contains("error:"));
         // The upgrade really was attempted.
         assert!(!mutating_runs(&runner).is_empty());
+    }
+
+    // --- Windows MSI -> MSIX (PowerShell 7.7.0 ships no MSI) -------------------
+
+    const MSI_CODE: &str = "{5417B253-1A6D-4638-BC94-743A6EC2E6F4}";
+
+    /// An MSI-installed 7.6.9 that winget also lists, whose latest winget
+    /// installer is MSIX — the exact host state behind winget's 0x8A15008E.
+    fn msi_host_with_msix_manifest() -> FakeRunner {
+        FakeRunner::pwsh("PowerShell 7.6.9")
+            .with_manager("powershell.exe", &format!("MSI {MSI_CODE}\r\n"))
+            .with_manager(
+                "winget",
+                "PowerShell 7.6.9.0-x64 Microsoft.PowerShell 7.6.9.0 7.7.0.0 winget\n  Installer Type: msix\n",
+            )
+            .with_manager("msiexec", "")
+            .resolved_at(r"\\?\C:\Program Files\PowerShell\7\pwsh.exe")
+    }
+
+    #[test]
+    fn check_msi_install_reports_migration_not_winget_upgrade() {
+        let http = FakeHttp::ok("7.7.0");
+        let runner = msi_host_with_msix_manifest();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_check(&http, &runner, Os::Windows, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(code, EXIT_UPDATE_AVAILABLE);
+        assert!(stdout.contains("Detected method: MSI"));
+        assert!(stdout.contains("pwsh-autoupdate --migrate"));
+        assert!(stdout.contains(&format!("msiexec /x {MSI_CODE} /qn /norestart")));
+        assert!(!stdout.contains("winget upgrade"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn update_msi_install_without_migrate_explains_and_changes_nothing() {
+        // Regression: previously ran `winget upgrade` and died with 0x8A15008E.
+        let http = FakeHttp::ok("7.7.0");
+        let runner = msi_host_with_msix_manifest();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Windows, true, false, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_FAILURE);
+        assert!(stderr.contains("only published as MSIX"));
+        assert!(stderr.contains("pwsh-autoupdate --migrate"));
+        assert!(
+            mutating_runs(&runner).is_empty(),
+            "{:?}",
+            mutating_runs(&runner)
+        );
+    }
+
+    #[test]
+    fn update_migrate_requires_elevation_and_never_self_elevates() {
+        let http = FakeHttp::ok("7.7.0");
+        let runner = msi_host_with_msix_manifest();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Windows, false, true, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_FAILURE);
+        assert!(stderr.contains("requires elevated privileges"));
+        assert!(mutating_runs(&runner).is_empty());
+    }
+
+    #[test]
+    fn update_migrate_removes_msi_then_installs_msix() {
+        let http = FakeHttp::ok("7.7.0");
+        let runner = msi_host_with_msix_manifest();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Windows, true, true, &mut out, &mut err);
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(
+            code,
+            EXIT_SUCCESS,
+            "stderr: {}",
+            String::from_utf8_lossy(&err)
+        );
+        assert!(stdout.contains("migrated to the MSIX package"));
+        let runs = mutating_runs(&runner);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[0].0, "msiexec");
+        assert_eq!(runs[0].1, vec!["/x", MSI_CODE, "/qn", "/norestart"]);
+        assert_eq!(runs[1].0, "winget");
+        assert_eq!(runs[1].1[0], "install");
+    }
+
+    #[test]
+    fn update_migrate_stops_when_msi_removal_fails() {
+        let http = FakeHttp::ok("7.7.0");
+        let runner =
+            msi_host_with_msix_manifest().fail_upgrade(1603, "Fatal error during installation.");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Windows, true, true, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_FAILURE);
+        assert!(stderr.contains("removing the PowerShell MSI failed"));
+        let runs = mutating_runs(&runner);
+        assert_eq!(runs.len(), 1, "winget install must not run: {runs:?}");
+        assert_eq!(runs[0].0, "msiexec");
+    }
+
+    #[test]
+    fn update_winget_technology_mismatch_is_explained() {
+        let http = FakeHttp::ok("7.7.0");
+        let runner = FakeRunner::pwsh("PowerShell 7.6.9")
+            .with_manager("winget", "Microsoft.PowerShell 7.6.9")
+            .fail_upgrade(-1978335090, "");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_update_with(&http, &runner, Os::Windows, true, false, &mut out, &mut err);
+        let stderr = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_FAILURE);
+        assert!(stderr.contains("different install technology"));
     }
 
     #[test]
@@ -1395,7 +1722,7 @@ mod tests {
             .fail_upgrade(-1978335189, "Installer failed.");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Windows, true, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Windows, true, false, &mut out, &mut err);
         let stdout = String::from_utf8(out).unwrap();
         let stderr = String::from_utf8(err).unwrap();
         assert_ne!(code, EXIT_SUCCESS);
@@ -1414,7 +1741,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         // elevated=true so the elevation gate does not trip first.
-        let code = run_update_with(&http, &runner, Os::Linux, true, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Linux, true, false, &mut out, &mut err);
         let stderr = String::from_utf8(err).unwrap();
         assert_ne!(code, EXIT_SUCCESS);
         assert!(stderr.contains("apt-get"));
@@ -1435,7 +1762,7 @@ mod tests {
             .with_manager("apt-get", "");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Linux, false, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Linux, false, false, &mut out, &mut err);
         let stderr = String::from_utf8(err).unwrap();
         assert_ne!(code, EXIT_SUCCESS);
         assert!(stderr.contains("elevated privileges"));
@@ -1450,7 +1777,7 @@ mod tests {
         let runner = FakeRunner::pwsh("PowerShell 7.4.0");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Linux, true, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Linux, true, false, &mut out, &mut err);
         let stderr = String::from_utf8(err).unwrap();
         assert_ne!(code, EXIT_SUCCESS);
         assert!(stderr.contains("could not determine how PowerShell was installed"));
@@ -1465,7 +1792,7 @@ mod tests {
         let runner = FakeRunner::default();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Linux, false, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Linux, false, false, &mut out, &mut err);
         assert_ne!(code, EXIT_SUCCESS);
         let stderr = String::from_utf8(err).unwrap();
         assert!(stderr.contains("not installed"));
@@ -1480,7 +1807,7 @@ mod tests {
         let runner = FakeRunner::default().with_manager("snap", "");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Linux, true, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Linux, true, false, &mut out, &mut err);
         let stdout = String::from_utf8(out).unwrap();
         assert_eq!(code, EXIT_SUCCESS);
         assert!(stdout.contains("Installing via snap"));
@@ -1499,7 +1826,7 @@ mod tests {
         let runner = FakeRunner::default().with_manager("snap", "");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Linux, false, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Linux, false, false, &mut out, &mut err);
         let stderr = String::from_utf8(err).unwrap();
         assert_ne!(code, EXIT_SUCCESS);
         assert!(stderr.contains("elevated privileges"));
@@ -1517,7 +1844,7 @@ mod tests {
             .fail_upgrade(1, "snap: install failed");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Linux, true, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Linux, true, false, &mut out, &mut err);
         let stdout = String::from_utf8(out).unwrap();
         let stderr = String::from_utf8(err).unwrap();
         assert_ne!(code, EXIT_SUCCESS);
@@ -1908,7 +2235,7 @@ mod tests {
         let runner = FakeRunner::pwsh("PowerShell 7.6.2").resolved_at(&binary);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Linux, false, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Linux, false, false, &mut out, &mut err);
         let stdout = String::from_utf8(out).unwrap();
         let stderr = String::from_utf8(err).unwrap();
         assert_ne!(code, EXIT_SUCCESS);
@@ -2009,7 +2336,7 @@ mod tests {
         let runner = FakeRunner::pwsh("PowerShell 7.4.0").with_manager("brew", "powershell");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_update_with(&http, &runner, Os::Macos, false, &mut out, &mut err);
+        let code = run_update_with(&http, &runner, Os::Macos, false, false, &mut out, &mut err);
         let stdout = String::from_utf8(out).unwrap();
         let stderr = String::from_utf8(err).unwrap();
         assert_ne!(code, EXIT_SUCCESS);

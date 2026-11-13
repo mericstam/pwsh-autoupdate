@@ -18,7 +18,16 @@ Alternatives considered:
 When multiple supported methods are detected, the tool selects exactly one via a fixed per-OS precedence and reports the selection plus the also-detected methods. The same precedence is applied identically in `--check` and update modes.
 
 Precedence (highest wins):
-- **Windows:** winget (`Microsoft.PowerShell`) > MSIX/Microsoft Store > MSI > Chocolatey.
+- **Windows:** MSIX/Microsoft Store > Chocolatey > MSI > winget (`Microsoft.PowerShell`).
+  *Amended 2026-11:* winget was originally highest, but `winget list --id Microsoft.PowerShell`
+  matches **any** installed PowerShell (winget correlates MSI/MSIX uninstall entries with its package
+  id), so it never proved ownership and masked the real install technology. That surfaced when
+  PowerShell 7.7.0 shipped MSIX-only: `winget upgrade` on an MSI install fails with `0x8A15008E`
+  (install technology mismatch). The install technology of the `pwsh` on PATH now decides (MSIX by
+  `WindowsApps` path / AppX registration, MSI by its uninstall registration); Chocolatey outranks MSI
+  because `powershell-core` wraps the MSI; winget is the fallback. An MSI install whose next release
+  is MSIX-only is migrated only on explicit opt-in (`--migrate`: `msiexec /x {code}` then
+  `winget install`), never implicitly.
 - **macOS:** Homebrew > `.pkg`.
 - **Linux:** native system package manager that owns the `pwsh` binary (apt/dpkg, dnf/rpm) > snap > portable tar.gz.
 

@@ -53,7 +53,7 @@ fn main() -> ExitCode {
         };
         app::run_uninstall(&runner, os, cli.yes, input, &mut stdout, &mut stderr)
     } else {
-        app::run_update(&http, &runner, os, &mut stdout, &mut stderr)
+        app::run_update(&http, &runner, os, cli.migrate, &mut stdout, &mut stderr)
     };
 
     ExitCode::from(code as u8)

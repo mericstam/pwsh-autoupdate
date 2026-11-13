@@ -175,10 +175,10 @@ pub struct UpdatePlan {
 
 | OS | Channel | Signal source the probe collects |
 |----|---------|----------------------------------|
-| Windows | winget | `winget list --id Microsoft.PowerShell` returns the package (and `pwsh` path under winget links / `%LOCALAPPDATA%\Microsoft\WindowsApps`). |
-| Windows | MSIX / Store | `pwsh_path` under `%ProgramFiles%\WindowsApps\Microsoft.PowerShell_*` or an MSIX/AppX package registration. |
-| Windows | MSI | MSI product registration for PowerShell (uninstall registry key / `pwsh_path` under `%ProgramFiles%\PowerShell\7`). |
-| Windows | Chocolatey | `choco list --local-only powershell-core` lists it (and `pwsh` under the Chocolatey lib/shim path). |
+| Windows | winget | Fallback only: `winget list --id Microsoft.PowerShell` returns the package. winget correlates ANY installed PowerShell with this id, so it does not prove ownership (ADR-0004 amendment). |
+| Windows | MSIX / Store | Resolved `pwsh` path under a `WindowsApps` dir (package or App Execution Alias); when the path cannot be resolved, a `Microsoft.PowerShell` AppX registration (`Get-AppxPackage`, via `powershell.exe`). |
+| Windows | MSI | Stable `PowerShell 7*` uninstall registration with `WindowsInstaller=1` (HKLM, incl. WOW6432Node, via `powershell.exe`) and the `pwsh` on PATH is not MSIX. The `{GUID}` product code is captured (strictly validated). For an MSI install, `winget show --id Microsoft.PowerShell --source winget` supplies the installer type of the latest package (`msix` from 7.7.0). |
+| Windows | Chocolatey | `choco list --local-only powershell-core` (v1) or `choco list powershell-core --exact --limit-output` (v2) lists it. |
 | macOS | Homebrew | `brew list --formula` (or `brew --prefix`) shows `powershell`, or `pwsh_path` resolves under the brew prefix (`/opt/homebrew` or `/usr/local`). |
 | macOS | `.pkg` | a PowerShell pkg receipt (`pkgutil --pkgs` matching `com.microsoft.powershell`), or `pwsh_path` under `/usr/local/microsoft/powershell`. |
 | Linux | apt/dpkg | `dpkg -S $(which pwsh)` / `dpkg -l powershell` reports ownership. |
@@ -199,8 +199,9 @@ The command string is built here so it is asserted in unit tests; the adapter on
 |----|--------|---------|------|--------------------|
 | Windows | Winget | `winget` | `upgrade --id Microsoft.PowerShell --silent --accept-source-agreements --accept-package-agreements` | no (per-user) — true if machine-scope |
 | Windows | Chocolatey | `choco` | `upgrade powershell-core -y` | yes (admin shell) |
-| Windows | MSIX / Store | `winget` | `upgrade --id Microsoft.PowerShell --source msstore --silent ...` (Store updates flow through winget/Store) | no |
-| Windows | MSI | `winget` | `upgrade --id Microsoft.PowerShell ...` (MSI channel is upgraded via the MSI/winget package; documented as the supported MSI upgrade) | yes |
+| Windows | MSIX / Store | `winget` | `upgrade --id Microsoft.PowerShell --source winget --silent ...` (the winget-source package is MSIX from 7.7.0; the msstore source has no `Microsoft.PowerShell` id) | no |
+| Windows | MSI | `winget` | `upgrade --id Microsoft.PowerShell ...` while winget's latest installer is still MSI | yes |
+| Windows | MSI -> MSIX | `msiexec`, then `winget` | when winget's latest installer is MSIX (7.7.0+, no MSI published): default update stops and explains; `--migrate` runs `msiexec /x {product-code} /qn /norestart` then (only on success, 0 or 3010) `winget install --id Microsoft.PowerShell --exact --source winget --silent ...` | yes (`msiexec /qn` cannot prompt) |
 | macOS | Homebrew | `brew` | `upgrade powershell` | no |
 | macOS | `.pkg` | (download + `installer`) | the `.pkg` replace procedure: fetch the latest `.pkg` asset, then `installer -pkg <file> -target /` | yes (`installer -target /`) |
 | Linux | apt/dpkg | `apt-get` | `install --only-upgrade -y powershell` | yes (root) |
@@ -236,7 +237,7 @@ does **not** accept `--accept-package-agreements` (install/upgrade-only flag).
 | OS | Method | program | args | requires_elevation | post_steps |
 |----|--------|---------|------|--------------------|------------|
 | Windows | Winget | `winget` | `uninstall --id Microsoft.PowerShell --silent --accept-source-agreements` | no | — |
-| Windows | MSIX / Store | `winget` | the same, plus `--source msstore` | no | — |
+| Windows | MSIX / Store | `winget` | the same (no `--source msstore`: that source has no `Microsoft.PowerShell` id) | no | — |
 | Windows | MSI | `winget` | `uninstall --id Microsoft.PowerShell --silent --accept-source-agreements` | yes | — |
 | Windows | Chocolatey | `choco` | `uninstall powershell-core -y` | yes | — |
 | macOS | Homebrew | `brew` | `uninstall powershell` | no | — |

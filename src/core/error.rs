@@ -56,6 +56,11 @@ pub enum PlanError {
     /// The (method, OS) pair has no defined procedure.
     #[error("no plan for method {method} on {os}")]
     UnsupportedCombination { method: String, os: String },
+
+    /// The registered MSI product code is not a well-formed `{GUID}`; it is
+    /// never passed to `msiexec`.
+    #[error("refusing to use malformed MSI product code {code:?}")]
+    InvalidMsiProductCode { code: String },
 }
 
 /// Failure performing the portable tar.gz download-and-replace (A-6).

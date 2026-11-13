@@ -10,7 +10,9 @@
 //! The rendered command is taken verbatim from the [`UpdatePlan`] so the
 //! reported command equals the executed one (FR-9 / ADR-0004 agreement).
 
-use crate::core::{Detection, InstallMethod, UninstallPlan, UpdatePlan, VersionState};
+use crate::core::{
+    Detection, InstallMethod, MigrationPlan, UninstallPlan, UpdatePlan, VersionState,
+};
 use semver::Version;
 use std::fmt;
 
@@ -28,6 +30,9 @@ pub struct CheckReport {
     /// The plan whose command would run, when a method was determined and an
     /// update is available. `None` when undetermined or already up to date.
     pub plan: Option<UpdatePlan>,
+    /// Set when the install cannot be upgraded in place and must migrate MSI
+    /// -> MSIX via `--migrate` (PowerShell 7.7.0+ ships no MSI).
+    pub migration: Option<MigrationPlan>,
 }
 
 impl CheckReport {
@@ -45,7 +50,15 @@ impl CheckReport {
             state,
             detection,
             plan,
+            migration: None,
         }
+    }
+
+    /// Attach the MSI -> MSIX migration the update requires instead of an
+    /// in-place upgrade (rendered in place of the "Would run" command).
+    pub fn with_migration(mut self, migration: MigrationPlan) -> Self {
+        self.migration = Some(migration);
+        self
     }
 }
 
@@ -78,6 +91,23 @@ impl fmt::Display for CheckReport {
             VersionState::UpdateAvailable => "update available",
         };
         writeln!(f, "Status:          {status}")?;
+
+        if let Some(m) = &self.migration {
+            let render =
+                |c: &crate::core::PlanCommand| format!("{} {}", c.program, c.args.join(" "));
+            writeln!(
+                f,
+                "Would run:       (none -- this MSI install cannot be upgraded in place: {} is only published as MSIX)",
+                m.to
+            )?;
+            write!(
+                f,
+                "Migrate with:    pwsh-autoupdate --migrate (elevated shell), which runs:\n                 {} && {}",
+                render(&m.uninstall),
+                render(&m.install)
+            )?;
+            return Ok(());
+        }
 
         match (&self.plan, self.detection.selected) {
             (Some(plan), _) => {
@@ -238,6 +268,34 @@ mod tests {
         );
         let out = report.to_string();
         assert!(out.contains("Detected method: winget (also detected: MSI, Chocolatey)"));
+    }
+
+    #[test]
+    fn msi_migration_report_shows_both_steps_instead_of_an_upgrade() {
+        let m = crate::core::plan::build_msi_to_msix_migration(
+            "{5417B253-1A6D-4638-BC94-743A6EC2E6F4}",
+            v("7.6.9"),
+            v("7.7.0"),
+        )
+        .unwrap();
+        let report = CheckReport::build(
+            v("7.6.9"),
+            v("7.7.0"),
+            VersionState::UpdateAvailable,
+            Detection {
+                selected: Some(InstallMethod::Msi),
+                also_detected: vec![InstallMethod::Winget],
+            },
+            None,
+        )
+        .with_migration(m);
+        let out = report.to_string();
+        assert!(out.contains("Detected method: MSI (also detected: winget)"));
+        assert!(out.contains("cannot be upgraded in place: 7.7.0 is only published as MSIX"));
+        assert!(out.contains("pwsh-autoupdate --migrate"));
+        assert!(out.contains(
+            "msiexec /x {5417B253-1A6D-4638-BC94-743A6EC2E6F4} /qn /norestart && winget install --id Microsoft.PowerShell"
+        ));
     }
 
     #[test]

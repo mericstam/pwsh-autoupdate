@@ -67,9 +67,24 @@ pub struct DetectionSignals {
     /// Raw `pwsh --version` output, parsed later by `version.rs`.
     pub current_version: Option<String>,
     // Per-channel ownership hints: "did this manager report owning pwsh?"
+    /// `winget list` matched `Microsoft.PowerShell`. NOTE: winget correlates
+    /// ANY installed PowerShell (MSI, MSIX, ...) with its package id, so this
+    /// says "winget can see it", not "winget installed it" — it is the lowest
+    /// precedence Windows signal, used only when no install technology is found.
     pub winget_lists_pwsh: bool,
+    /// The pwsh on PATH is an MSIX/AppX package (`WindowsApps` path, or an
+    /// AppX registration when the path cannot be resolved).
     pub msix_registered: bool,
+    /// An MSI product registration for PowerShell 7 exists and the pwsh on
+    /// PATH is not the MSIX package.
     pub msi_registered: bool,
+    /// The validated `{GUID}` product code of that MSI registration — needed
+    /// to remove the MSI when migrating to MSIX.
+    pub msi_product_code: Option<String>,
+    /// Installer technology winget would use for the latest
+    /// `Microsoft.PowerShell` (e.g. `msix`), lowercase. Probed only for an MSI
+    /// install, to detect the MSI -> MSIX switch (7.7.0+ ships no MSI).
+    pub winget_installer_type: Option<String>,
     pub choco_lists_pwsh: bool,
     pub brew_lists_pwsh: bool,
     pub pkg_receipt_present: bool,
@@ -137,6 +152,27 @@ pub struct UninstallPlan {
     /// Best-effort follow-ups run only after the primary command succeeds
     /// (macOS .pkg populates this with `pkgutil --forget` receipt cleanup).
     pub post_steps: Vec<PlanCommand>,
+}
+
+/// The MSI -> MSIX migration plan (opt-in via `--migrate`).
+///
+/// PowerShell 7.7.0 stopped shipping an MSI; winget's `Microsoft.PowerShell`
+/// package is MSIX from then on, and winget refuses to upgrade across install
+/// technologies (`0x8A15008E`). An MSI install can therefore only move forward
+/// by removing the MSI and installing the MSIX package. Both steps are fixed
+/// here so the `--check` report shows exactly what `--migrate` runs (FR-9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationPlan {
+    pub from: semver::Version,
+    pub to: semver::Version,
+    /// Step 1: remove the MSI by product code (`msiexec /x {GUID} /qn`).
+    pub uninstall: PlanCommand,
+    /// Step 2: install the MSIX package via winget. Runs only if step 1
+    /// succeeded.
+    pub install: PlanCommand,
+    /// `msiexec /qn` on a per-machine product cannot raise a UAC prompt, so
+    /// the host must already be elevated (FR-12: never self-elevate).
+    pub requires_elevation: bool,
 }
 
 /// A single `program args...` invocation. Used for a plan's optional follow-up

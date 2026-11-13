@@ -13,6 +13,10 @@
 //!   path). Asks for interactive confirmation; `--yes` skips the prompt and is
 //!   required when stdin is not a terminal.
 //!
+//! * `--migrate`: modifier for the update path (Windows). Permits switching an
+//!   MSI install to the MSIX package when the new release ships no MSI
+//!   (PowerShell 7.7.0+). Without it such an update stops and explains.
+//!
 //! `--verbose` only toggles extra diagnostic output; it carries no domain logic.
 
 use clap::Parser;
@@ -50,6 +54,14 @@ pub struct Cli {
     #[arg(long, short = 'y', requires = "uninstall", conflicts_with_all = ["check", "replace_portable"])]
     pub yes: bool,
 
+    /// Windows: allow the update to migrate an MSI install to the MSIX package
+    /// when the latest release is no longer published as MSI (PowerShell
+    /// 7.7.0+). Removes the MSI (`msiexec /x`) and then installs the MSIX via
+    /// `winget install`. Requires an elevated shell. Without this flag such an
+    /// update stops and explains instead.
+    #[arg(long, conflicts_with_all = ["check", "replace_portable", "uninstall"])]
+    pub migrate: bool,
+
     /// Print additional diagnostic detail to stderr.
     #[arg(long, short)]
     pub verbose: bool,
@@ -73,6 +85,18 @@ mod tests {
         assert!(!cli.check);
         assert!(!cli.replace_portable);
         assert!(!cli.verbose);
+        assert!(!cli.migrate);
+    }
+
+    #[test]
+    fn parses_migrate_flag_and_rejects_other_modes() {
+        assert!(Cli::parse_from(["pwsh-autoupdate", "--migrate"]).migrate);
+        for other in ["--check", "--replace-portable", "--uninstall"] {
+            assert!(
+                Cli::try_parse_from(["pwsh-autoupdate", "--migrate", other]).is_err(),
+                "--migrate must conflict with {other}"
+            );
+        }
     }
 
     #[test]
