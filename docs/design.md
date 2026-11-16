@@ -89,7 +89,7 @@ impl HttpClient for RealHttp { /* ... */ }
 pub struct CmdOutput { pub status: i32, pub stdout: String, pub stderr: String }
 
 pub trait CommandRunner {
-    /// Run a program with args; capture status+stdout+stderr. IO failure -> PlanError/anyhow context.
+    /// Run a program with args; capture status+stdout+stderr. IO failure -> PlanError.
     fn run(&self, program: &str, args: &[&str]) -> Result<CmdOutput, std::io::Error>;
     /// Is the program resolvable on PATH? Used before running a plan's command (FR-6).
     fn exists(&self, program: &str) -> bool;
