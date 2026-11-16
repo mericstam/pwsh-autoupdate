@@ -108,3 +108,9 @@ degradation), never a silent fallback to another channel (FR-6).
 
 ## Supersedes
 None. Continues the product ADR sequence (0001–0004) without contradicting any of them.
+
+## Amendment (2026-11-16): `anyhow` removed
+`anyhow` was pinned above but never imported: every error path uses the typed `thiserror` errors
+in `core/error.rs`, and `app.rs` maps them directly to ADR-0002 exit codes. Cargo 1.100's
+`unused_dependencies` lint flagged it, so it is removed from `Cargo.toml`. All other choices in
+this ADR stand. Adding `anyhow` back later for application-level error context needs no new ADR.
