@@ -264,7 +264,7 @@ Single persona: a developer or operator on their own workstation or a server, co
 
 ## 8. Constraints & Assumptions *(core)*
 
-- **Stack:** Rust (stable toolchain, 2021 edition), Cargo. Shipped crates (ADR-0005): `clap` (CLI), `serde`/`serde_json` (metadata parsing), `ureq` (HTTP client), `semver` (comparison), `anyhow`/`thiserror` (errors); `mockito` + `assert_cmd`/`predicates`/`tempfile` for hermetic tests. Package managers (winget, choco, brew, apt/dpkg, dnf/rpm, snap) are runtime dependencies invoked as external processes, not linked libraries.
+- **Stack:** Rust (stable toolchain, 2021 edition), Cargo. Shipped crates (ADR-0005): `clap` (CLI), `serde`/`serde_json` (metadata parsing), `ureq` (HTTP client), `semver` (comparison), `thiserror` (errors); `mockito` + `assert_cmd`/`predicates`/`tempfile` for hermetic tests. Package managers (winget, choco, brew, apt/dpkg, dnf/rpm, snap) are runtime dependencies invoked as external processes, not linked libraries.
 - **Dependencies/licensing:** MIT / Apache-2.0 only. No GPL-family libraries. No paid-only SaaS.
 - **Non-functional:** cross-platform (Win/macOS/Linux); no GUI; tests perform no real network access and spawn no real package-manager process (hermetic via mocked HTTP + mocked process execution).
 - **Appetite:** ≤1,500,000 tokens and ≤3h wall-clock per run.
